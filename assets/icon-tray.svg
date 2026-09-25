@@ -1,0 +1,21 @@
+<svg width="512" height="512" viewBox="0 0 512 512" xmlns="http://www.w3.org/2000/svg" aria-label="Blockslot">
+  <!-- The app icon for 16 to 32 pixels: the same cube and arrows, with the
+       dots and the slot left out and the arrows thicker, because at that
+       size the detail turns into noise and thin arrows disappear. -->
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="2" refY="5" markerWidth="2.1"
+            markerHeight="2.1" orient="auto">
+      <path d="M1 1 L9 5 L1 9 Z" fill="#F6B23C"/>
+    </marker>
+  </defs>
+  <!-- No tile: the tray sits on a light or a dark taskbar. -->
+  <path d="M60 196 A206 206 0 0 1 428 150" fill="none" stroke="#F6B23C"
+        stroke-width="44" stroke-linecap="butt" marker-end="url(#arrow)"/>
+  <path d="M452 316 A206 206 0 0 1 84 362" fill="none" stroke="#F6B23C"
+        stroke-width="44" stroke-linecap="butt" marker-end="url(#arrow)"/>
+  <circle cx="60" cy="196" r="22" fill="#F6B23C"/>
+  <circle cx="452" cy="316" r="22" fill="#F6B23C"/>
+  <polygon points="256,120 376,190 256,260 136,190" fill="#5CE1C8"/>
+  <polygon points="136,190 256,260 256,400 136,330" fill="#2A9E8C"/>
+  <polygon points="256,260 376,190 376,330 256,400" fill="#17685E"/>
+</svg>

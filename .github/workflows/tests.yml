@@ -1,0 +1,82 @@
+name: Tests
+
+# Blockslot runs on three operating systems and on whatever python each one
+# ships, so it is tested on all three. The oldest python in play is macOS
+# system python 3.9, and the engine and the window are both written to it.
+#
+# No dependencies are installed anywhere in this file, on purpose. If a test
+# needs a package, something has stopped being standard library only.
+
+on:
+  push:
+    paths:
+      - "engine/**"
+      - "gui/**"
+      - ".github/workflows/tests.yml"
+  pull_request:
+  workflow_dispatch:
+  workflow_call:
+
+jobs:
+  engine:
+    name: Engine
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.9"
+      - run: python engine/test_savepick.py
+
+  gui:
+    name: Window on ${{ matrix.os }} (python ${{ matrix.python }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # 3.9 is the floor: macOS system python. 3.13 is what Windows runs.
+          - os: ubuntu-latest
+            python: "3.9"
+          - os: ubuntu-latest
+            python: "3.13"
+          - os: macos-latest
+            python: "3.9"
+          - os: windows-latest
+            python: "3.13"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+
+      - name: Give Linux a display for the window tests
+        # Without one the window tests skip themselves, which would mean the
+        # only job that can see a layout mistake quietly checks nothing.
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends xvfb python3-tk
+
+      - name: Tests
+        if: runner.os != 'Linux'
+        run: python gui/tests/run.py
+
+      - name: Tests, under a virtual display
+        if: runner.os == 'Linux'
+        run: xvfb-run -a python gui/tests/run.py
+
+      - name: The window tests must not have skipped
+        # A skip here is the failure mode that hides every other failure. Only
+        # one job has to prove it, and this is the one with a display.
+        if: runner.os == 'Linux' && matrix.python == '3.13'
+        run: |
+          xvfb-run -a python gui/tests/test_ui.py -v 2>&1 | tee out.txt
+          if grep -qi "skipped" out.txt; then
+            echo "FAIL: the window tests skipped, so nothing was checked"
+            exit 1
+          fi
+
+      - name: It still reports what it can see with no Steam at all
+        run: python gui/blockslot.py --check

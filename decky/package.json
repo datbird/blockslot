@@ -1,0 +1,44 @@
+{
+  "name": "blockslot",
+  "version": "0.1.0",
+  "description": "Save sync for the games Steam Cloud does not cover.",
+  "author": "datbird",
+  "license": "MIT",
+  "scripts": {
+    "build": "rollup -c",
+    "watch": "rollup -c -w"
+  },
+  "devDependencies": {
+    "@decky/rollup": "^1.0.2",
+    "@decky/ui": "^4.11.0",
+    "@rollup/rollup-linux-x64-musl": "^4.53.3",
+    "@types/react": "19.1.1",
+    "@types/react-dom": "19.1.1",
+    "rollup": "^4.53.3",
+    "typescript": "^5.6.2"
+  },
+  "dependencies": {
+    "@decky/api": "^1.1.3",
+    "tslib": "^2.7.0"
+  },
+  "pnpm": {
+    "peerDependencyRules": {
+      "ignoreMissing": [
+        "react",
+        "react-dom"
+      ]
+    }
+  },
+  "type": "module",
+  "remote_binary": [
+    {
+      "name": "ludusavi-linux.tar.gz",
+      "url": "https://github.com/mtkennerly/ludusavi/releases/download/v0.31.0/ludusavi-v0.31.0-linux.tar.gz",
+      "sha256hash": "7322ff45d41eae7ae064a80d8c9ecccc5b8fb6fc090a603a66369cd4b054068d"
+    }
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/datbird/blockslot-decky.git"
+  }
+}

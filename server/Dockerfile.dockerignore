@@ -1,0 +1,11 @@
+# Send only what the image copies. The context is the whole repo.
+*
+!engine/slotstore.py
+!engine/saveunits.py
+!server/entrypoint.py
+!server/blockslot_server
+!assets/icon.svg
+!THIRD-PARTY-NOTICES.md
+!LICENSE
+**/__pycache__
+**/*.pyc

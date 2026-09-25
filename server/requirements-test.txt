@@ -1,0 +1,5 @@
+# Test only. The server itself is the Python standard library and nothing else.
+# PyJWT and cryptography sign the Cloudflare Access test tokens, so the
+# server's own RS256 check is tested against an independent implementation.
+PyJWT[crypto]==2.15.0
+cryptography==50.0.1

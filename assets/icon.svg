@@ -1,0 +1,30 @@
+<svg width="512" height="512" viewBox="0 0 512 512" xmlns="http://www.w3.org/2000/svg" aria-label="Blockslot">
+  <!-- The designer's app icon (App icon-html.zip, 2026-09-25) with two
+       changes: the arrow lines end flat, so their round cap no longer bulges
+       past the arrowhead (a round dot keeps the tail end round), and the
+       four corner squares are gone because they show at no real size. -->
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="2" refY="5" markerWidth="2.5"
+            markerHeight="2.5" orient="auto">
+      <path d="M1 1 L9 5 L1 9 Z" fill="#F6B23C"/>
+    </marker>
+  </defs>
+  <rect x="0" y="0" width="512" height="512" rx="116" fill="#10141B"/>
+  <rect x="1" y="1" width="510" height="510" rx="115" fill="none" stroke="#222A36" stroke-width="2"/>
+  <path d="M71.8 189.0 A196 196 0 0 1 425.7 158.0" fill="none" stroke="#F6B23C"
+        stroke-width="22" stroke-linecap="butt" marker-end="url(#arrow)"/>
+  <path d="M440.2 323.0 A196 196 0 0 1 86.3 354.0" fill="none" stroke="#F6B23C"
+        stroke-width="22" stroke-linecap="butt" marker-end="url(#arrow)"/>
+  <circle cx="71.8" cy="189.0" r="11" fill="#F6B23C"/>
+  <circle cx="440.2" cy="323.0" r="11" fill="#F6B23C"/>
+  <polygon points="256,136 360,196 256,256 152,196" fill="#5CE1C8"/>
+  <polygon points="152,196 256,256 256,376 152,316" fill="#2A9E8C"/>
+  <polygon points="256,256 360,196 360,316 256,376" fill="#17685E"/>
+  <polyline points="256,256 256,376" fill="none" stroke="#0E3D37" stroke-width="2"/>
+  <line x1="282" y1="301" x2="334" y2="271" stroke="#0A0F14" stroke-width="16" stroke-linecap="round"/>
+  <g fill="#E9FFF9">
+    <rect x="176" y="282" width="14" height="14" transform="skewY(30) translate(0 -101.6)"/>
+    <rect x="198" y="282" width="14" height="14" transform="skewY(30) translate(0 -114.3)"/>
+    <rect x="220" y="282" width="14" height="14" transform="skewY(30) translate(0 -127)" opacity="0.45"/>
+  </g>
+</svg>

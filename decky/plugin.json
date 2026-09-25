@@ -1,0 +1,12 @@
+{
+  "name": "Blockslot",
+  "version": "0.1.0",
+  "author": "datbird",
+  "flags": [],
+  "api_version": 1,
+  "publish": {
+    "tags": ["saves", "sync", "backup", "cloud"],
+    "description": "Sync game saves between your Deck and your other machines, for the games Steam Cloud does not cover. Turn it on per game from the Quick Access menu.",
+    "image": "https://raw.githubusercontent.com/datbird/blockslot-decky/main/assets/blockslot.png"
+  }
+}

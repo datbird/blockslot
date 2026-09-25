@@ -1,0 +1,27 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="dark">
+<title>BlockSlot</title>
+<link rel="icon" href="/static/icon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="/static/app.css">
+<script src="/static/app.js" defer></script>
+</head>
+<body>
+<noscript><p class="noscript">BlockSlot needs JavaScript to show this page.</p></noscript>
+<div id="root"></div>
+<dialog id="confirm" class="modal">
+  <form method="dialog">
+    <h2 id="confirm-title"></h2>
+    <p id="confirm-text"></p>
+    <div class="row-end">
+      <button value="cancel" class="btn ghost" id="confirm-no">Cancel</button>
+      <button value="ok" class="btn primary" id="confirm-yes">OK</button>
+    </div>
+  </form>
+</dialog>
+<div id="toast" role="status" aria-live="polite"></div>
+</body>
+</html>

@@ -1,0 +1,182 @@
+# One tag releases everything:
+#
+#     git tag v1.0.0 && git push origin v1.0.0
+#
+# - the server image, linux/amd64 and linux/arm64, to ghcr.io (and Docker Hub
+#   once DOCKERHUB_IMAGE is set);
+# - BlockSlot for Windows, one exe in a zip, attached to a GitHub release;
+# - the Decky plugin as the zip Decky's "Install Plugin from ZIP" takes, until
+#   it is in the Decky store.
+#
+# Every test suite has to pass first. Nothing reaches anyone's server or PC
+# from a build that fails its own tests.
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+env:
+  # Docker Hub is where people look first; ghcr.io has no pull limit, so the
+  # Unraid template points there.
+  GHCR_IMAGE: ghcr.io/${{ github.repository_owner }}/blockslot-server
+  DOCKERHUB_IMAGE: ${{ vars.DOCKERHUB_IMAGE }}
+
+jobs:
+  app-tests:
+    uses: ./.github/workflows/tests.yml
+
+  server-tests:
+    uses: ./.github/workflows/server.yml
+
+  version:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: The tag matches the version in the code
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          code=$(sed -n 's/^__version__ = "\(.*\)"/\1/p' server/blockslot_server/__init__.py)
+          [ "v$code" = "${{ github.ref_name }}" ] || { echo "tag ${{ github.ref_name }} but code says $code"; exit 1; }
+
+  image:
+    needs: [app-tests, server-tests, version]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Log in to ghcr.io
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Skipped until DOCKERHUB_IMAGE, DOCKERHUB_USERNAME and DOCKERHUB_TOKEN
+      # exist, so releases work before Docker Hub is set up.
+      - name: Log in to Docker Hub
+        if: vars.DOCKERHUB_IMAGE != ''
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: |
+            ${{ env.GHCR_IMAGE }}
+            ${{ env.DOCKERHUB_IMAGE }}
+          # v1.2.3 becomes 1.2.3, 1.2 and 1, plus latest. A manual run
+          # publishes :edge only, so the pipeline can be proved without
+          # spending a version number.
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=semver,pattern={{major}}
+            type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/v') }}
+            type=raw,value=edge,enable=${{ github.event_name == 'workflow_dispatch' }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+        env:
+          DOCKER_METADATA_ANNOTATIONS_LEVELS: manifest,index
+
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: server/Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          annotations: ${{ steps.meta.outputs.annotations }}
+          build-args: VERSION=${{ github.ref_name }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  decky:
+    needs: [app-tests, version]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Build the plugin and zip it the way Decky installs it
+        working-directory: decky
+        run: |
+          pnpm install --frozen-lockfile
+          pnpm build
+          python3 scripts/package.py
+          mv out/Blockslot.zip "../BlockSlot-${{ github.ref_name }}-decky.zip"
+          cd .. && sha256sum "BlockSlot-${{ github.ref_name }}-decky.zip" > "BlockSlot-${{ github.ref_name }}-decky.zip.sha256"
+      - name: Attach to the release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            BlockSlot-${{ github.ref_name }}-decky.zip
+            BlockSlot-${{ github.ref_name }}-decky.zip.sha256
+
+  windows:
+    needs: [app-tests, version]
+    runs-on: windows-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: PyInstaller (build time only; the app itself is standard library)
+        run: python -m pip install "pyinstaller==6.22.3"
+
+      - name: Build BlockSlot.exe
+        run: python tools/build_exe.py --clean
+
+      - name: It starts and reports what it can see
+        run: dist\Blockslot.exe --check
+
+      - name: Zip it
+        shell: pwsh
+        run: |
+          $name = "BlockSlot-${{ github.ref_name }}-windows-x64.zip"
+          New-Item -ItemType Directory -Force stage | Out-Null
+          Copy-Item dist\Blockslot.exe stage\BlockSlot.exe
+          Copy-Item tools\windows-readme.txt "stage\READ ME.txt"
+          Copy-Item LICENSE stage\LICENSE.txt
+          Copy-Item THIRD-PARTY-NOTICES.md stage\THIRD-PARTY-NOTICES.md
+          Compress-Archive -Path stage\* -DestinationPath $name
+          (Get-FileHash $name -Algorithm SHA256).Hash.ToLower() + "  " + $name | Out-File -Encoding ascii "$name.sha256"
+          "ZIP=$name" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+
+      - name: Attach to the release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            ${{ env.ZIP }}
+            ${{ env.ZIP }}.sha256
+          generate_release_notes: true
+
+      - name: Keep the zip on a manual run
+        if: github.event_name == 'workflow_dispatch'
+        uses: actions/upload-artifact@v4
+        with:
+          name: blockslot-windows
+          path: ${{ env.ZIP }}
