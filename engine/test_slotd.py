@@ -456,6 +456,30 @@ class CentralSettings(Base):
         self.assertFalse(self.d.sync_config(now=1000.0 + 10))
         self.assertTrue(self.d.sync_config(now=1000.0 + slotd.CONFIG_EVERY + 1))
 
+    def test_a_save_made_during_the_sync_is_never_undone(self):
+        """The file changes between the daemon reading it and writing it: the
+        daemon must not put the old version back (seen on CI: the service's
+        reload test read "one" after "two" had been written)."""
+        real = slotd.central_merge
+
+        def merge_while_someone_saves(data, *args):
+            answer = real(data, *args)
+            changed = self.read()
+            changed["trees"]["RetroFrontend"]["roots"]["desktop"] = "G:/moved"
+            self.write(changed)
+            return answer
+
+        slotd.central_merge = merge_while_someone_saves
+        try:
+            self.assertFalse(self.d.sync_config(force=True))
+        finally:
+            slotd.central_merge = real
+        self.assertEqual(self.read()["trees"]["RetroFrontend"]["roots"]["desktop"], "G:/moved")
+        # The next pass merges the saved version and carries the change on.
+        self.assertTrue(self.d.sync_config(now=time.time()))
+        self.assertEqual(self.read()["trees"]["RetroFrontend"]["roots"]["desktop"], "G:/moved")
+        self.assertEqual(self.own_file()["roots"], {"RetroFrontend": "G:/moved"})
+
     def test_other_settings_survive(self):
         self.d.sync_config(force=True)
         self.assertEqual(self.read()["store"]["type"], "local")

@@ -243,9 +243,13 @@ def central_merge(data, shared, devices, device, now=None):
                             if name in trees},
                   "name": own.get("name") or ""}
     write = None
-    if remote is None or (agreed is not None and local != agreed and local != remote):
-        # First time on this store, or changed on this device since the last
-        # sync: the store takes this device's word.
+    ours = own is not None and own.get("set_by") == "device"
+    if (remote is None or (agreed is None and ours and local != remote)
+            or (agreed is not None and local != agreed and local != remote)):
+        # First time on this store, changed on this device since the last
+        # sync, or the store holds only this device's own earlier word (its
+        # write here was never recorded, so nothing newer came from the web):
+        # the store takes this device's word.
         chosen = local
         write = {"version": 1, "device": me, "name": local["name"] or me,
                  "roots": local["roots"], "updated": ss.iso(now), "set_by": "device"}
@@ -609,8 +613,9 @@ class Daemon(object):
             self._note_error(exc)
             return False
         try:
-            with open(self.config_path, "r", encoding="utf-8") as handle:
-                data = json.load(handle)
+            with open(self.config_path, "rb") as handle:
+                before = handle.read()
+            data = json.loads(before.decode("utf-8"))
         except (OSError, ValueError):
             return False
         merged, own = central_merge(data, shared, devices, self.device)
@@ -625,7 +630,16 @@ class Daemon(object):
                 merged["central"]["own"] = (data.get("central") or {}).get("own")
         if merged == data:
             return False
+        # The app, the tray or a person may have saved the file while the
+        # store was being read. Writing now would put their change back to
+        # what it was, silently. Leave it, and merge their version on the next
+        # pass instead. (What is left is the instant between this read and the
+        # replace below, not the seconds a store round trip takes.)
         try:
+            with open(self.config_path, "rb") as handle:
+                if handle.read() != before:
+                    self._config_at = 0.0
+                    return False
             write_config(self.config_path, merged)
         except OSError:
             return False
