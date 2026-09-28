@@ -156,6 +156,17 @@ at 11:04 reached Steam's pairing step: `remote_connections.txt` logged
 "Received authorization request" from the VM, which needs a PIN typed on
 this desktop's screen, and it was cancelled there.
 
+**Proven at 11:59 the same day.** With the PIN typed on this desktop, the VM
+streamed Getting Over It from it. Snap Steam ran this desktop's launch option:
+`savepick.log` opened with `started (pid N) for steam app 240720; Remote Play:
+streaming to a client at 1728x1084, so no dialog is shown on this host`, and
+the game's environment held `SteamStreaming=1`,
+`SteamStreamingMaximumResolution=1728x1084`, `SteamStreamingVideo=1`,
+`SteamStreamingInput=1` and `SteamStreamingAudio=1`. The engine chose
+"launch (linux saves)" and showed nothing. A SIGTERM to savepick then stopped
+the game first ("the rest of the game has stopped"), and the exit upload was
+committed.
+
 ## Still unproven
 
 - The engine's dialogs under snap Steam. The snap carries its own zenity
@@ -166,8 +177,5 @@ this desktop's screen, and it was cancelled there.
   is no flatpak Steam on either test bed.
 - Blockslot's own non-Steam shortcut under snap Steam: the window needs
   tkinter, and core24's python has none (`No module named 'tkinter'`, seen).
-- The unit on the test laptop itself (not installed there, by instruction).
-- A real Remote Play stream from this desktop. The Mac VM was never paired
-  with it (pairing needs a PIN typed on this screen), so no streamed launch
-  has run here. That the host applies its own launch option and sets
-  `SteamStreaming=1` is from other people's reports, not seen here.
+- A Remote Play stream hosted by Windows or a Mac. Only a Linux host was seen
+  (above); whether they set the same variables is not proven.

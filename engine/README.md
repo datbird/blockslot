@@ -575,7 +575,8 @@ again. `caffeinate -i` keeps the Mac awake while a save uploads.
 A streamed game runs on the host, and the host's Steam starts it with the host's own
 launch option, so the wrap runs there exactly as for a local launch. Steam marks such a
 launch with `SteamStreaming=1` and `SteamStreamingMaximumResolution=WxH` in the game's
-environment, and savepick reads that:
+environment, and savepick reads that. Proven with a Linux host (snap Steam) on
+2026-09-28, streaming to a Mac; a Windows or Mac host is not yet seen:
 
 - **Nothing is asked.** `ask_user` returns None (nobody answered), which is never a
   restore. In store mode the fork is left open rather than closed as "kept this
