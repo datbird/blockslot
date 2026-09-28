@@ -601,6 +601,12 @@ tree when a stop signal arrives. Whatever outlives the launcher gets a few secon
 end on its own, then the same signal, then a kill at the usual 30 second deadline, and
 only then does the exit backup run.
 
+On a Mac a game that is a `.app` is started with `open -W`, which hands it to
+LaunchServices, so the game is launchd's child and no walk down from savepick finds
+it. Seen on a macOS VM on 2026-09-28: the stop reached `open`, the backup ran, and the
+game kept playing. The processes running from inside that `.app` now join the tree
+that gets stopped (`opened_app`, `app_pids`).
+
 ## Logging
 
 `%TEMP%\savepick.log` on Windows, `~/.local/state/blockslot/savepick.log` on Linux, the

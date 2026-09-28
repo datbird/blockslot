@@ -110,7 +110,7 @@ adds your first device. More in [the server's README](server/README.md).
 
 ### 3. Steam Deck
 
-The plugin is waiting for review in the Decky store. Until then:
+The plugin is not in the Decky store yet. Install the release's zip:
 
 1. In Decky, open Settings and turn on **Developer mode**.
 2. Under **Developer**, choose **Install Plugin from URL** and give it the
@@ -124,20 +124,19 @@ The plugin is waiting for review in the Decky store. Until then:
 
 ### Mac (Apple silicon)
 
-No release carries the Mac app yet. The release workflow builds
-`BlockSlot-<version>-mac-arm64.zip` from the next one on. Until then, build it
-on the Mac (see [Building from source](#building-from-source)).
-
-1. Put `Blockslot.app` in `/Applications` and open it from there. Launch
+1. Download `BlockSlot-<version>-mac-arm64.zip` from the
+   [latest release](https://github.com/datbird/blockslot/releases/latest)
+   (from 1.0.3 on) and unzip it.
+2. Put `Blockslot.app` in `/Applications` and open it from there. Launch
    options and the LaunchAgent name the app by its path, so a copy run from
    Downloads or a disk image is refused. The app is signed ad hoc, not
-   notarized: the first open is right-click, **Open**, or System Settings,
-   Privacy & Security, **Open Anyway**.
-2. Pair it on **Store**, as on Windows. Secrets go into the login Keychain.
-3. In **Settings**, install ludusavi if it is missing.
-4. Install the daemon as a LaunchAgent:
+   notarized. A copy your browser downloaded opens the first time only
+   through System Settings, Privacy & Security, **Open Anyway**.
+3. Pair it on **Store**, as on Windows. Secrets go into the login Keychain.
+4. In **Settings**, install ludusavi if it is missing.
+5. Install the daemon as a LaunchAgent:
    `/Applications/Blockslot.app/Contents/MacOS/Blockslot --install-service`.
-5. On **Games**, turn sync on. A game gets the launch option
+6. On **Games**, turn sync on. A game gets the launch option
    `/Applications/Blockslot.app/Contents/MacOS/Blockslot --pick -- %command%`.
    The app carries the engine, so the Mac needs no python.
 
@@ -145,8 +144,10 @@ on the Mac (see [Building from source](#building-from-source)).
 
 Run BlockSlot from a checkout with `python3 gui/blockslot.py` (the window needs
 tkinter, `python3-tk` on Debian and Ubuntu), and install the daemon as a
-systemd user unit with `python3 gui/blockslot.py --install-service`. Games get
-the python form of the launch option, which names `~/.local/bin/savepick.py`.
+systemd user unit with `python3 gui/blockslot.py --install-service`. Pair it on
+**Store**, then in **Settings** install the engine (it goes to
+`~/.local/bin/savepick.py`) and ludusavi. Games get the python form of the
+launch option, which names that engine.
 Steam from the snap, the flatpak or the distribution is found. What works
 under snap Steam and why is in [docs/linux-desktop.md](docs/linux-desktop.md).
 
@@ -231,9 +232,10 @@ from `engine/`: `python3 -m unittest test_slotstore test_slotd test_saveunits`.
 ## Status
 
 In daily use by its author on a Windows PC and a Steam Deck. On 2026-09-28 a
-Mac (macOS 26.6) and an Ubuntu 26.04 laptop with snap Steam each ran a game
-through BlockSlot, and each exit backup reached the store. The server is
-new. One gap is known: the **Emulator games** screen still keys each folder by
+Mac (macOS 26.6, running the release's Mac app) and an Ubuntu 26.04 laptop
+with snap Steam each ran a game through BlockSlot, each exit backup reached
+the store, each kept its own save history, and a Remote Play stream hosted by
+the laptop synced like a local launch. The server is new. One gap is known: the **Emulator games** screen still keys each folder by
 the older Syncthing device folder, so a device set up with only a store cannot
 give an emulator its folder yet. Bug reports and pull requests are welcome in
 [issues](https://github.com/datbird/blockslot/issues).
