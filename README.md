@@ -12,7 +12,7 @@
   <a href="#get-started">Get started</a> ·
   <a href="server/README.md">Server</a> ·
   <a href="decky/README.md">Steam Deck</a> ·
-  <a href="gui/README.md">Windows</a>
+  <a href="gui/README.md">Windows, Mac and Linux</a>
 </p>
 
 ---
@@ -34,6 +34,9 @@ BlockSlot fixes that for the games Steam misses:
   never guesses.
 - **Emulators too.** A RetroArch, RetroBat or RetroDECK saves folder is split
   into one save per game, and each game keeps its own history.
+- **Each OS keeps its own history.** A Mac never restores a Linux save of the
+  same game, because the two builds save different files in different places.
+  A Windows game under Proton on the Deck shares its history with Windows.
 
 <p align="center">
   <img src="server/docs/images/01-games.png" alt="Every game on the store, in the web UI" width="100%">
@@ -42,8 +45,8 @@ BlockSlot fixes that for the games Steam misses:
 ## How it fits together
 
 ```
-  Windows PC                Steam Deck               any other device
-  BlockSlot.exe             BlockSlot for Decky
+  Windows PC                Steam Deck               Mac, Linux desktop
+  BlockSlot.exe             BlockSlot for Decky       Blockslot.app, a checkout
         \                         |                         /
          \  upload on exit, restore before start          /
           `---------------.       |       .--------------'
@@ -56,9 +59,26 @@ BlockSlot fixes that for the games Steam misses:
   and the settings they share. One Docker container. Unraid has a template.
 - **Each device** runs a small daemon that uploads and restores. On Windows it
   is a service with a tray icon. On the Deck it lives inside the Decky plugin.
+  On a Mac it is a LaunchAgent, and on a Linux desktop a systemd user unit.
 - **Steam starts the game through BlockSlot.** Turning sync on for a game sets
   its launch option, and BlockSlot then runs the game itself. Steam's files
   are never edited by hand.
+
+### Streaming with Steam Remote Play
+
+A streamed game runs on the machine that streams it (the host), not on the
+one in your hands, and the host's Steam starts it with the host's own launch
+option. So where BlockSlot is installed on the host and the game is turned on
+there, a stream syncs exactly like a local launch: the newest save is restored
+before the game starts and uploaded after it quits.
+
+- **No dialogs on the host.** Nobody sits there during a stream, so nothing is
+  asked and nothing waits. Two saves that were both played are left for the
+  next launch in front of a screen to decide, and warnings go to the log.
+- **A game already running on the host is joined, not started.** Steam turns
+  the Play button into "Stream from" that machine and nothing is restored.
+  Quit it there first if you played somewhere else since.
+- The client needs BlockSlot only if you also play on it locally.
 
 ## Get started
 
@@ -101,6 +121,34 @@ The plugin is waiting for review in the Decky store. Until then:
 3. On the server's **Devices** page, add the Deck. In the plugin, open
    **Server**, enter the address and the code, and pair.
 4. On **Games**, turn a game on.
+
+### Mac (Apple silicon)
+
+No release carries the Mac app yet. The release workflow builds
+`BlockSlot-<version>-mac-arm64.zip` from the next one on. Until then, build it
+on the Mac (see [Building from source](#building-from-source)).
+
+1. Put `Blockslot.app` in `/Applications` and open it from there. Launch
+   options and the LaunchAgent name the app by its path, so a copy run from
+   Downloads or a disk image is refused. The app is signed ad hoc, not
+   notarized: the first open is right-click, **Open**, or System Settings,
+   Privacy & Security, **Open Anyway**.
+2. Pair it on **Store**, as on Windows. Secrets go into the login Keychain.
+3. In **Settings**, install ludusavi if it is missing.
+4. Install the daemon as a LaunchAgent:
+   `/Applications/Blockslot.app/Contents/MacOS/Blockslot --install-service`.
+5. On **Games**, turn sync on. A game gets the launch option
+   `/Applications/Blockslot.app/Contents/MacOS/Blockslot --pick -- %command%`.
+   The app carries the engine, so the Mac needs no python.
+
+### Linux desktop
+
+Run BlockSlot from a checkout with `python3 gui/blockslot.py` (the window needs
+tkinter, `python3-tk` on Debian and Ubuntu), and install the daemon as a
+systemd user unit with `python3 gui/blockslot.py --install-service`. Games get
+the python form of the launch option, which names `~/.local/bin/savepick.py`.
+Steam from the snap, the flatpak or the distribution is found. What works
+under snap Steam and why is in [docs/linux-desktop.md](docs/linux-desktop.md).
 
 ## Screenshots
 
@@ -149,8 +197,16 @@ with pip to run it.
 |---|---|---|
 | Server | `server/` | `docker build -f server/Dockerfile -t blockslot-server .` |
 | Windows app | `gui/` | `python tools/build_exe.py` (PyInstaller, build time only) |
+| Mac app | `gui/` | `python3 tools/build_exe.py --zip` on an Apple silicon Mac (see below) |
 | Decky plugin | `decky/` | `pnpm install && pnpm build && python3 scripts/package.py` |
 | Engine | `engine/` | nothing to build: one file per job, shared by every device |
+
+The Mac build needs python.org's Python (universal2, with its own Tcl/Tk) and
+Apple's Command Line Tools (`xcode-select --install`), because PyInstaller
+calls `lipo` and `install_name_tool`. It writes `dist/Blockslot.app`, a
+self-contained arm64 folder bundle signed ad hoc, and `--zip` packs it into
+`dist/Blockslot-mac-arm64.zip`. Only the build needs any of this. The app runs
+on a Mac with no python and no developer tools.
 
 ```
 engine/     the save picker Steam starts, the store client, the device daemon
@@ -158,7 +214,7 @@ gui/        the desktop app. gui/core holds every rule; gui/ui draws them
 decky/      the SteamOS plugin. It carries a staged copy of gui/core
 server/     the container: Garage and the web UI
 index/      games.json: which files are saves, which games Steam Cloud covers
-tools/      the index generator and the Windows build
+tools/      the index generator and the Windows and Mac builds
 ```
 
 Tests run on every push, on Windows, macOS and Linux:
@@ -169,10 +225,17 @@ python gui/tests/run.py
 python -m unittest discover server/tests
 ```
 
+The store, the daemon and the save splitter have suites of their own, run
+from `engine/`: `python3 -m unittest test_slotstore test_slotd test_saveunits`.
+
 ## Status
 
-In daily use by its author on a Windows PC and a Steam Deck. The server is
-new. Bug reports and pull requests are welcome in
+In daily use by its author on a Windows PC and a Steam Deck. On 2026-09-28 a
+Mac (macOS 26.6) and an Ubuntu 26.04 laptop with snap Steam each ran a game
+through BlockSlot, and each exit backup reached the store. The server is
+new. One gap is known: the **Emulator games** screen still keys each folder by
+the older Syncthing device folder, so a device set up with only a store cannot
+give an emulator its folder yet. Bug reports and pull requests are welcome in
 [issues](https://github.com/datbird/blockslot/issues).
 
 ## License and credit

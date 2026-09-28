@@ -302,6 +302,7 @@ async function gamesPage(refresh) {
             h("div", { class: "title" }, g.title),
             h("div", { class: "meta" },
               g.label ? h("span", { class: "chip teal" }, g.label) : null,
+              ...osChips(g.systems),
               g.library ? h("span", { class: "muted small" }, g.library) : null,
               g.heads > 1 ? h("span", { class: "chip orange" }, "Two saves") : null,
               g.uploading ? h("span", { class: "chip" }, "Uploading") : null)),
@@ -337,6 +338,15 @@ async function loadDeviceNames(force) {
 
 function who(id) { return deviceNames[id] || id; }
 
+// Each OS keeps its own history of a game: a Mac never restores a Linux
+// save, so every save says which OS it is for. "any" is a save every OS
+// shares, an emulator's, and needs no label.
+const OS_NAMES = { windows: "Windows", linux: "Linux", mac: "macOS" };
+function osName(os) { return OS_NAMES[os] || ""; }
+function osChips(systems) {
+  return (systems || []).filter((x) => osName(x.os)).map((x) => h("span", { class: "chip" }, osName(x.os)));
+}
+
 async function gamePage(key) {
   const body = h("div", {}, h("p", { class: "muted" }, "Reading the history..."));
   mount(shell("games", [h("a", { class: "back", href: "#/games" }, "All games"), body]));
@@ -350,15 +360,17 @@ async function gamePage(key) {
     return;
   }
   const byId = Object.fromEntries(g.history.map((s) => [s.id, s]));
-  const onlyHead = g.heads.length === 1 ? g.heads[0] : null;
 
   async function doRestore(snap, settle) {
     const s = byId[snap];
+    // A restore only ever reaches devices of the save's own OS.
+    const os = osName(s.os);
+    const which = os ? " " + os : "";
     const ok = await ask(settle ? "Keep this save?" : "Restore this save?",
-      settle ? "The save from " + who(s.device) + " (" + fmtTime(s.played_end || s.created) + ") becomes the one save. " +
-               "Each device restores it at its next launch. The other save stays in the history."
-             : "The save from " + who(s.device) + " (" + fmtTime(s.played_end || s.created) + ") becomes the current save. " +
-               "Each device restores it at its next launch. Nothing is deleted.",
+      settle ? "The save from " + who(s.device) + " (" + fmtTime(s.played_end || s.created) + ") becomes the one" + which + " save. " +
+               "Each" + which + " device restores it at its next launch. The other save stays in the history."
+             : "The save from " + who(s.device) + " (" + fmtTime(s.played_end || s.created) + ") becomes the current" + which + " save. " +
+               "Each" + which + " device restores it at its next launch. Nothing is deleted.",
       settle ? "Keep this save" : "Restore this save");
     if (!ok) return;
     try {
@@ -369,10 +381,13 @@ async function gamePage(key) {
     } catch (e) { toast(e.message, true); }
   }
 
-  const fork = g.heads.length > 1 ? h("div", { class: "panel fork" },
-    h("div", { class: "panel-head" }, h("h2", {}, "Two saves"), h("span", { class: "chip orange" }, g.heads.length + " saves")),
+  // A fork is only ever within one OS's history; each gets its own panel.
+  const forks = Object.entries(g.families || { any: g.heads }).filter(([, heads]) => heads.length > 1)
+    .map(([os, heads]) => h("div", { class: "panel fork" },
+    h("div", { class: "panel-head" }, h("h2", {}, osName(os) ? "Two " + osName(os) + " saves" : "Two saves"),
+      h("span", { class: "chip orange" }, heads.length + " saves")),
     h("p", { class: "muted" }, "More than one device played this game without the other's save. Pick the one to keep. The other stays in the history."),
-    h("div", { class: "choices" }, g.heads.map((id) => {
+    h("div", { class: "choices" }, heads.map((id) => {
       const s = byId[id];
       const b = h("button", { class: "btn warn small", type: "button" }, "Keep " + who(s.device) + "'s save");
       b.addEventListener("click", () => doRestore(id, true));
@@ -381,11 +396,12 @@ async function gamePage(key) {
         h("div", { class: "mono small" }, fmtTime(s.played_end || s.created)),
         playTime(s.played_start, s.played_end) ? h("div", { class: "muted small" }, "Played " + playTime(s.played_start, s.played_end)) : null,
         b);
-    }))) : null;
+    }))));
 
   const chain = h("ol", { class: "chain" }, g.history.map((s) => {
     const actions = h("div", { class: "actions" });
-    if (s.id !== onlyHead) {
+    // The current save of its OS needs no restore; one of two still can be.
+    if (!(s.head && s.family_heads === 1)) {
       const b = h("button", { class: "btn small", type: "button" }, "Restore this save");
       b.addEventListener("click", () => doRestore(s.id, false));
       actions.append(b);
@@ -399,7 +415,8 @@ async function gamePage(key) {
       h("div", { class: "slot" + (s.head ? " head" : "") },
         h("div", { class: "slot-top" },
           h("div", {}, h("div", { class: "row" }, h("span", { class: "device" }, who(s.device)),
-                         s.head ? h("span", { class: "chip orange" }, g.heads.length > 1 ? "Undecided" : "Current") : null),
+                         osName(s.os) ? h("span", { class: "chip" }, osName(s.os)) : null,
+                         s.head ? h("span", { class: "chip orange" }, s.family_heads > 1 ? "Undecided" : "Current") : null),
             h("div", { class: "mono small muted" }, fmtTime(s.created))),
           actions),
         h("div", { class: "facts" },
@@ -417,7 +434,7 @@ async function gamePage(key) {
   body.replaceChildren(
     pageHead(g.library ? "Library game in " + g.library : "Game", g.title,
       g.label ? h("span", { class: "chip teal" }, g.label) : null),
-    h("div", { class: "stack" }, fork,
+    h("div", { class: "stack" }, ...forks,
       h("div", { class: "panel-head" }, h("h2", {}, "History"),
         h("span", { class: "muted small" }, g.history.length + (g.history.length === 1 ? " save" : " saves"))),
       chain));

@@ -10,7 +10,7 @@ import re
 import sys
 from pathlib import Path
 
-from . import vdf
+from . import paths, vdf
 
 APPMANIFEST = re.compile(r"^appmanifest_(\d+)\.acf$")
 
@@ -31,13 +31,29 @@ class Game(object):
         return "Game(%d, %r)" % (self.appid, self.name)
 
 
-def candidate_roots():
+# Where each way of installing Steam on Linux keeps its data, under the home.
+NATIVE = "native"
+SNAP = "snap"
+FLATPAK = "flatpak"
+SNAP_DATA = ("snap", "steam", "common", ".local", "share", "Steam")
+FLATPAK_DATA = (".var", "app", "com.valvesoftware.Steam", ".local", "share",
+                "Steam")
+
+
+def candidate_roots(home=None):
     """Every place Steam is normally installed on this operating system.
 
-    Order matters: the first one that holds a userdata directory wins, so a
-    flatpak install does not shadow a native one that is actually in use.
+    On Linux there are three installs, and each keeps its data somewhere
+    else: the distribution's package in ~/.local/share/Steam (with ~/.steam
+    pointing at it), the snap in ~/snap/steam/common/.local/share/Steam
+    (Ubuntu's Software centre installs this one), and the flatpak under
+    ~/.var/app. The snap gives Steam its own HOME, so its ~/.steam lives
+    inside the snap too and never points at it from the real home.
+
+    Order matters only as a tie-break: find_root prefers the Steam that is
+    running, then the one signed into last.
     """
-    home = Path.home()
+    home = Path(home) if home is not None else paths.home()
     if sys.platform == "win32":
         found = []
         registered = _windows_install_path()
@@ -55,8 +71,68 @@ def candidate_roots():
         home / ".local" / "share" / "Steam",
         home / ".steam" / "steam",
         home / ".steam" / "root",
-        home / ".var" / "app" / "com.valvesoftware.Steam" / ".local" / "share" / "Steam",
+        home.joinpath(*SNAP_DATA),
+        home.joinpath(*FLATPAK_DATA),
     ]
+
+
+def install_kind(root):
+    """NATIVE, SNAP or FLATPAK: how the Steam at `root` was installed.
+
+    It decides what a launch option can name (paths.python_for_steam): a snap
+    or flatpak game starts in a sandbox with its own /usr. Read from the
+    path, resolved, so ~/.steam/steam pointing into the snap counts as snap.
+    """
+    try:
+        parts = Path(root).resolve().parts
+    except (OSError, RuntimeError):
+        parts = Path(root).parts
+    if _contains(parts, SNAP_DATA):
+        return SNAP
+    if _contains(parts, FLATPAK_DATA):
+        return FLATPAK
+    return NATIVE
+
+
+def _contains(parts, run):
+    size = len(run)
+    return any(tuple(parts[at:at + size]) == run
+               for at in range(len(parts) - size + 1))
+
+
+def running_roots(proc="/proc", home=None):
+    """The Steam folders a running Steam client was started from (Linux).
+
+    The client is `<root>/ubuntu12_32/steam` for every install, snap
+    included, and its first argument is that full path. Read from
+    /proc/<pid>/cmdline, which any process of the same user can read, so it
+    needs neither pgrep nor psutil. Empty anywhere else.
+
+    The flatpak is the exception: its sandbox mounts ~/.var/app/<id> over
+    the home, so its path reads like a native install's. Its environment
+    names it (FLATPAK_ID), and that is mapped back to the real folder.
+    """
+    home = Path(home) if home is not None else paths.home()
+    found = []
+    try:
+        pids = [name for name in os.listdir(proc) if name.isdigit()]
+    except OSError:
+        return found
+    for pid in pids:
+        try:
+            with open(os.path.join(proc, pid, "cmdline"), "rb") as handle:
+                first = handle.read(4096).split(b"\0", 1)[0]
+        except OSError:
+            continue
+        program = Path(os.fsdecode(first))
+        if program.name != "steam" or program.parent.name != "ubuntu12_32":
+            continue
+        root = program.parent.parent
+        if _is_flatpak(os.path.join(proc, pid)):
+            root = home.joinpath(*FLATPAK_DATA)
+        if root not in found:
+            found.append(root)
+    return found
 
 
 def _windows_install_path():
@@ -80,21 +156,64 @@ def _windows_install_path():
     return None
 
 
-def find_root(candidates=None):
+def _is_flatpak(where):
+    try:
+        with open(os.path.join(where, "environ"), "rb") as handle:
+            return b"FLATPAK_ID=com.valvesoftware.Steam" in handle.read()
+    except OSError:
+        return False
+
+
+def find_root(candidates=None, running=None):
     """The Steam directory in use, or None.
 
     A directory only counts when it holds userdata. An empty Steam folder left
     behind by an uninstall would otherwise be picked over the real one.
+
+    With more than one (a native Steam tried once, then the snap), the one
+    running now wins, then the one whose loginusers.vdf was written last:
+    Steam rewrites it at every sign-in, so it names the install a person
+    actually uses. `running` is running_roots() unless given.
     """
-    for path in (candidates if candidates is not None else candidate_roots()):
+    if candidates is None:
+        candidates = candidate_roots()
+    unique = []
+    for path in candidates:
         path = Path(path)
-        if (path / "userdata").is_dir():
-            return path
-    for path in (candidates if candidates is not None else candidate_roots()):
-        path = Path(path)
+        key = _same(path)
+        if key not in [_same(seen) for seen in unique]:
+            unique.append(path)
+    with_users = [path for path in unique if (path / "userdata").is_dir()]
+    if with_users:
+        if running is None:
+            running = running_roots() if sys.platform.startswith("linux") else []
+        live = set(_same(path) for path in running)
+        for path in with_users:
+            if _same(path) in live:
+                return path
+        return max(with_users, key=lambda path: (
+            _mtime(path / "config" / "loginusers.vdf"),
+            -with_users.index(path)))
+    for path in unique:
         if (path / "steamapps").is_dir():
             return path
     return None
+
+
+def _same(path):
+    """A path with its links resolved, so ~/.steam/steam and the folder it
+    points at are one install, not two."""
+    try:
+        return Path(path).resolve()
+    except (OSError, RuntimeError):
+        return Path(path)
+
+
+def _mtime(path):
+    try:
+        return path.stat().st_mtime
+    except OSError:
+        return 0.0
 
 
 def library_paths(root):

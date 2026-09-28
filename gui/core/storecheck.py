@@ -382,12 +382,15 @@ def restart_daemon(settings, wait=5.0, starter=None):
         subprocess.Popen(autostart.command_argv(), close_fds=True,
                          creationflags=0x00000008 | 0x00000200 | 0x08000000)
     else:
+        # With the systemd user unit installed this asks systemd to start it.
         slotd.start_detached()
+    at_login = paths.is_windows() or (
+        paths.is_linux() and os.path.isfile(slotd.systemd_unit_path()))
     deadline = _time.monotonic() + wait
     while _time.monotonic() < deadline:
         if slotd._client_from_info(state_dir):
             return "The uploader is running%s." % (
-                " and starts at login" if paths.is_windows() else "")
+                " and starts at login" if at_login else "")
         _time.sleep(0.2)
     return "The uploader did not start. Saves still upload when a game exits."
 

@@ -9,10 +9,26 @@ PC needs no python at all:
 
     "LaunchOptions"  "<Blockslot.exe> --pick -- %command%"
 
+and from the built Mac app, the same, naming the binary inside the bundle:
+
+    "LaunchOptions"  "<Blockslot.app>/Contents/MacOS/Blockslot --pick -- %command%"
+
 Steam replaces %command% with everything it would have run, so savepick gets
 the real command line and starts it itself. That is the whole hook, and it is
 the only point in a launch that is early enough to be safe: the restore has to
 finish before the game opens its save file.
+
+A Mac run from source takes the python form unchanged. Its client does
+substitute %command% (steamclient.dylib carries the LaunchOptions and
+%command% handling next to its macOS launch path), and what it names there is expected to be the binary
+inside the game's .app rather than the .app itself. That part is not yet
+seen in a real launch: the macOS VM had no game installed on 2026-09-28, so its
+gameprocess_log.txt was empty. savepick logs the command it was handed
+("launching: ..."), which settles it on the first run, and it runs an .app
+through `open -W` if that is what arrives (savepick.mac_command). The python
+named must be a real one, never the /usr/bin/python3 stub on a Mac without
+the developer tools (paths.mac_python); the built app names itself and no
+python at all, which is how a Mac with no developer tools runs BlockSlot.
 
 KEEPING WHAT WAS ALREADY THERE
 
@@ -81,15 +97,25 @@ def _parts(value):
 
 
 def _is_pick(tokens):
-    """True for an exe-hosted head: `<something.exe> --pick ...`, or a
-    shortcut's `--pick ...`, whose exe field holds the program. Only the
-    Windows build writes this form, so the program always ends in .exe."""
+    """True for a head hosted by the built program: `<something.exe> --pick
+    ...`, `<Something.app>/Contents/MacOS/<name> --pick ...`, or a shortcut's
+    `--pick ...`, whose exe field holds the program. Only the Windows and Mac
+    builds write this form, so the program is always one of those two
+    shapes, and a player's own `sometool --pick` is left alone."""
     if not tokens:
         return False
     if tokens[0] == PICK:
         return True
     return (len(tokens) > 1 and tokens[1] == PICK
-            and tokens[0].lower().endswith(".exe"))
+            and is_built_program(tokens[0]))
+
+
+def is_built_program(path):
+    """True for a Windows exe, or the binary inside a Mac .app bundle."""
+    text = str(path).replace("\\", "/")
+    if text.lower().endswith(".exe"):
+        return True
+    return bool(re.search(r"\.app/Contents/MacOS/[^/]+$", text))
 
 
 def _separator_at(value):
@@ -235,6 +261,23 @@ def engine_of(value, exe=None):
         return str(exe).strip().strip('"') if exe else PICK
     tokens = [token for token in head if token.lower().endswith(".py")]
     return tokens[-1] if tokens else None
+
+
+def python_of(value, exe=None):
+    """The interpreter a wrapped option in the python form runs, or None.
+
+    The first word of the head, or for a wrapped shortcut its exe field,
+    which holds the interpreter. None for the exe form, which has none.
+    """
+    parts = _parts(value)
+    if parts is None:
+        return None
+    head = _split(parts[0])
+    if _is_pick(head):
+        return None
+    if head[0].lower().endswith(".py"):
+        return str(exe).strip().strip('"') if exe else None
+    return head[0]
 
 
 def strip(value):

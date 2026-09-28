@@ -21,7 +21,7 @@ import sys
 import time
 from pathlib import Path
 
-from . import paths, vdf
+from . import paths, steamdir, vdf
 
 APPS_PATH = ["UserLocalConfigStore", "Software", "Valve", "Steam", "apps"]
 LAUNCH_KEY = "LaunchOptions"
@@ -249,36 +249,134 @@ def steam_running():
     return bool(_steam_pids())
 
 
-def _steam_pids():
-    if sys.platform == "win32":
+def steam_process_name(system=None):
+    """The client's process name: steam_osx on a Mac, steam on Linux."""
+    return "steam_osx" if (system or sys.platform) == "darwin" else "steam"
+
+
+def _steam_pids(run=None, system=None):
+    run = run or subprocess.run
+    system = system or sys.platform
+    if system == "win32":
         try:
-            out = subprocess.run(
+            out = run(
                 ["tasklist", "/FI", "IMAGENAME eq steam.exe", "/NH"],
                 capture_output=True, text=True, timeout=20,
                 **paths.no_window()).stdout
         except (OSError, subprocess.SubprocessError):
             return []
         return [line for line in out.splitlines() if "steam.exe" in line.lower()]
+    # Only this user's Steam: another account's on the same machine is not
+    # the one holding this localconfig.vdf, and waiting for it to close would
+    # time out. On a Mac the client is steam_osx: a search for "steam" finds
+    # nothing there, and a write would go ahead with Steam open and be lost.
+    # It runs from inside ~/Library/Application Support/Steam/Steam.AppBundle,
+    # not from /Applications/Steam.app, which only bootstraps it.
     try:
-        out = subprocess.run(["pgrep", "-x", "steam"], capture_output=True,
-                             text=True, timeout=20).stdout
+        out = run(["pgrep", "-x", "-u", str(os.getuid()),
+                   steam_process_name(system)],
+                  capture_output=True, text=True, timeout=20).stdout
     except (OSError, subprocess.SubprocessError):
         return []
     return [line for line in out.split() if line.strip()]
 
 
+SNAP_STEAM = "/snap/bin/steam"
+FLATPAK_STEAM = ["flatpak", "run", "com.valvesoftware.Steam"]
+
+
 def steam_binary(root=None):
-    """The command that starts Steam on this machine, or None."""
-    if sys.platform == "win32":
+    """The program that starts Steam on this machine, or None."""
+    if sys.platform == "darwin":
+        app = mac_steam_app()
+        return str(Path(app) / "Contents" / "MacOS" / "steam_osx") if app else None
+    command = steam_command(root)
+    return command[0] if command else None
+
+
+def steam_command(root=None, which=None, exists=None, system=None):
+    """The command that runs the Steam in use at `root`, as a list, or None.
+
+    A root inside the Steam snap or the flatpak is started through them: the
+    steam on PATH may be a different install, or none, and running the
+    client's own files from outside its sandbox does not work.
+    """
+    which = which or shutil.which
+    exists = exists or os.path.exists
+    system = system or sys.platform
+    if system == "win32":
         if root:
             candidate = Path(root) / "steam.exe"
             if candidate.is_file():
-                return str(candidate)
-        found = shutil.which("steam.exe")
-        return found
-    if sys.platform == "darwin":
-        return "/Applications/Steam.app/Contents/MacOS/steam_osx"
-    return shutil.which("steam")
+                return [str(candidate)]
+        found = which("steam.exe")
+        return [found] if found else None
+    if system == "darwin":
+        # Through LaunchServices, as the Dock would, so Steam is not a child
+        # of this window and does not go when it closes.
+        app = mac_steam_app()
+        return ["/usr/bin/open", "-a", app] if app else None
+    kind = steamdir.install_kind(root) if root else None
+    if kind == steamdir.SNAP and exists(SNAP_STEAM):
+        # With the distribution's steam installed as well, `steam` on PATH
+        # is that one, and it would ask a Steam that is not running to shut
+        # down. The snap's own launcher always lives here.
+        return [SNAP_STEAM]
+    if kind == steamdir.FLATPAK and which("flatpak"):
+        # The flatpak is started through `flatpak run`, not by a file of
+        # its own.
+        return list(FLATPAK_STEAM)
+    found = which("steam") or (SNAP_STEAM if exists(SNAP_STEAM) else None)
+    return [found] if found else None
+
+
+def shutdown_command(root=None, system=None, **found):
+    """The command that asks the running Steam to exit cleanly, or None.
+
+    `steam -shutdown` on Windows and Linux. A Mac's steam_osx is started by
+    Launch Services, not by hand, so it is asked through Steam's own URL,
+    which the running client handles the same way.
+    """
+    if (system or sys.platform) == "darwin":
+        return ["/usr/bin/open", "steam://exit"]
+    command = steam_command(root, system=system, **found)
+    return command + ["-shutdown"] if command else None
+
+
+def _detached():
+    """Popen arguments that leave Steam running after this window closes."""
+    if sys.platform == "win32":
+        return paths.no_window()
+    # Its own session, so closing the terminal Blockslot was started from, or
+    # Blockslot itself, does not take a restarted Steam down with it.
+    return {"start_new_session": True}
+
+
+def mac_steam_app(exists=os.path.isdir):
+    """Steam.app, in /Applications or the user's own Applications, or None."""
+    for folder in (Path("/Applications"), Path.home() / "Applications"):
+        if exists(str(folder / "Steam.app")):
+            return str(folder / "Steam.app")
+    return None
+
+
+def stop_command(root=None, platform=None):
+    """The command that asks Steam to exit cleanly, or None.
+
+    On a Mac that is the steam://exit link, opened by LaunchServices: it
+    reaches the Steam that is running and needs no permission to script
+    another app. Elsewhere, `steam -shutdown` (shutdown_command).
+    """
+    return shutdown_command(root, system=platform)
+
+
+def start_command(root=None, platform=None):
+    """The command that starts Steam, or None (steam_command).
+
+    A Mac starts it through LaunchServices, as the Dock would, so Steam is
+    not a child of this window and does not go when it closes.
+    """
+    return steam_command(root, system=platform)
 
 
 def stop_steam(root=None, timeout=STEAM_STOP_SECONDS):
@@ -289,12 +387,12 @@ def stop_steam(root=None, timeout=STEAM_STOP_SECONDS):
     """
     if not steam_running():
         return True
-    binary = steam_binary(root)
-    if binary:
+    command = shutdown_command(root)
+    if command:
         try:
-            subprocess.Popen([binary, "-shutdown"],
+            subprocess.Popen(command,
                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                             **paths.no_window())
+                             stdin=subprocess.DEVNULL, **_detached())
         except (OSError, subprocess.SubprocessError):
             pass
     deadline = time.monotonic() + timeout
@@ -306,12 +404,13 @@ def stop_steam(root=None, timeout=STEAM_STOP_SECONDS):
 
 
 def start_steam(root=None):
-    binary = steam_binary(root)
-    if not binary:
+    command = start_command(root)
+    if not command:
         return False
     try:
-        subprocess.Popen([binary], stdout=subprocess.DEVNULL,
-                         stderr=subprocess.DEVNULL, **paths.no_window())
+        subprocess.Popen(command, stdout=subprocess.DEVNULL,
+                         stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL,
+                         **_detached())
         return True
     except (OSError, subprocess.SubprocessError):
         return False

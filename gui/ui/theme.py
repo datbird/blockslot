@@ -36,15 +36,24 @@ class Metrics(object):
     800 is the Steam Deck. Anything taller gets proportionally bigger text, up
     to a cap, because past a point bigger stops helping and starts wasting the
     list.
+
+    height and width are at 100 percent, and `dpi` is the display's scale
+    (core/uiscale). Font sizes are points, which the display scales by
+    itself, so they use only the window's scale. Everything else is pixels,
+    so `scale`, and every size derived from it, carries the display's scale
+    too. Without that, 200 percent meant double-size text in a 100 percent
+    layout.
     """
 
-    def __init__(self, height=800, width=1280):
-        scale = max(0.85, min(1.9, height / 800.0))
-        self.scale = scale
-        self.base = int(round(15 * scale))
-        self.small = int(round(12.5 * scale))
-        self.large = int(round(20 * scale))
-        self.huge = int(round(27 * scale))
+    def __init__(self, height=800, width=1280, dpi=1.0):
+        text_scale = max(0.85, min(1.9, height / 800.0))
+        self.dpi = dpi
+        self.text_scale = text_scale
+        self.scale = scale = text_scale * dpi
+        self.base = int(round(15 * text_scale))
+        self.small = int(round(12.5 * text_scale))
+        self.large = int(round(20 * text_scale))
+        self.huge = int(round(27 * text_scale))
         self.row_height = int(round(44 * scale))
         self.pad = int(round(12 * scale))
         self.gap = int(round(8 * scale))
@@ -53,6 +62,15 @@ class Metrics(object):
         self.radius = int(round(6 * scale))
         self.width = width
         self.height = height
+
+    def px(self, value):
+        """A length given in 100 percent pixels, at this display's scale.
+
+        For the places that place text by its point size (a second line
+        drawn `small * 0.95` below the middle): points grow with the
+        display, so the offset has to grow with it.
+        """
+        return value * self.dpi
 
     def font(self, size="base", bold=False):
         family = FAMILY

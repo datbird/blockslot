@@ -5,6 +5,9 @@
 # - the server image, linux/amd64 and linux/arm64, to ghcr.io (and Docker Hub
 #   once DOCKERHUB_IMAGE is set);
 # - BlockSlot for Windows, one exe in a zip, attached to a GitHub release;
+# - BlockSlot for Apple Silicon Macs, the .app in a zip, signed ad hoc (not
+#   notarized: the first open is Finder's right-click > Open, or System
+#   Settings > Privacy & Security > Open Anyway), attached to the same release;
 # - the Decky plugin as the zip Decky's "Install Plugin from ZIP" takes, until
 #   it is in the Decky store.
 #
@@ -179,4 +182,53 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: blockslot-windows
+          path: ${{ env.ZIP }}
+
+  mac:
+    needs: [app-tests, version]
+    # macos-14 is Apple Silicon, so the arm64 app is built on arm64 and can
+    # be started here before it ships.
+    runs-on: macos-14
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      # setup-python's macOS builds are python.org's own universal2 installer,
+      # with the Tcl/Tk the window needs inside it.
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: PyInstaller (build time only; the app itself is standard library)
+        run: python -m pip install "pyinstaller==6.22.3"
+
+      - name: Build BlockSlot.app, signed ad hoc, and zip it
+        run: python tools/build_exe.py --clean --zip --version "${{ github.ref_name }}"
+
+      - name: It is arm64, signed, and starts and reports what it can see
+        run: |
+          lipo -archs dist/Blockslot.app/Contents/MacOS/Blockslot | grep -qw arm64
+          codesign --verify --deep --strict dist/Blockslot.app
+          dist/Blockslot.app/Contents/MacOS/Blockslot --check
+
+      - name: Name the zip for the release
+        run: |
+          name="BlockSlot-${{ github.ref_name }}-mac-arm64.zip"
+          mv dist/Blockslot-mac-arm64.zip "$name"
+          shasum -a 256 "$name" > "$name.sha256"
+          echo "ZIP=$name" >> "$GITHUB_ENV"
+
+      - name: Attach to the release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            ${{ env.ZIP }}
+            ${{ env.ZIP }}.sha256
+
+      - name: Keep the zip on a manual run
+        if: github.event_name == 'workflow_dispatch'
+        uses: actions/upload-artifact@v4
+        with:
+          name: blockslot-mac
           path: ${{ env.ZIP }}

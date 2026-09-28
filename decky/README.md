@@ -79,6 +79,11 @@ for the newest save of that game.
 - Two devices both played from the same save: it asks which one to keep, and
   shows both dates.
 
+Each OS keeps its own history of a game. A Windows game under Proton keeps its
+save in the Wine prefix, so it shares its history with your Windows PC. A
+native Linux game shares with other Linux devices. A save made on a Mac, or by
+a build for another OS, is never restored here.
+
 When you quit, the engine backs the save up and uploads it. With no network,
 the save waits in a queue and goes up later. A save is never restored over a
 newer one without asking.
@@ -100,7 +105,8 @@ The plugin runs without root.
 ## Building
 
 `main.py` is the backend. `py_modules/blockslot_core` holds every rule about
-which save wins, and the Windows app runs that same code. `defaults/` holds
+which save wins, and the desktop app on Windows, macOS and Linux runs that
+same code. `defaults/` holds
 the engine, the game index and the third-party notices; its contents land in
 the plugin's root when it is packaged.
 

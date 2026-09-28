@@ -144,6 +144,97 @@ class Restore(helpers.StoreCase):
             saves.restore(self.store, view, old["id"])
 
 
+class OperatingSystems(helpers.StoreCase):
+    """Each OS keeps its own history. The web UI shows which OS each save is
+    for, and a restore only ever reaches devices of that save's OS."""
+
+    def play_os(self, device, kind, save, parents=None):
+        import tempfile
+        from test_slotstore import GOI, os_backup
+        source = os_backup(tempfile.mkdtemp(dir=self.dir), kind, save)
+        state = self.state(device)
+        manifest = state.stage(GOI, device, source, parents=parents)
+        self.assertIsNone(ss.drain(self.store, state)[1])
+        return manifest
+
+    def key(self):
+        from test_slotstore import GOI
+        return ss.game_key(GOI)
+
+    def test_the_games_list_counts_forks_within_one_os(self):
+        self.play_os("ubuntu", "linux", b"l")
+        self.play_os("imac", "mac", b"m")
+        row = saves.Catalog(self.store).games()[0]
+        # Two heads on the store, but one per OS: nothing to settle.
+        self.assertEqual(row["heads"], 1)
+        self.assertEqual(sorted(x["os"] for x in row["systems"]), [ss.LINUX, ss.MAC])
+
+    def test_history_says_each_saves_os(self):
+        linux = self.play_os("ubuntu", "linux", b"l")
+        mac = self.play_os("imac", "mac", b"m")
+        view = saves.Catalog(self.store).view(self.key())
+        rows = {row["id"]: row for row in saves.history(view)}
+        self.assertEqual(rows[linux["id"]]["os"], ss.LINUX)
+        self.assertEqual(rows[mac["id"]]["os"], ss.MAC)
+        # Each is the current save of its own OS, and neither is a fork.
+        for row in rows.values():
+            self.assertTrue(row["head"])
+            self.assertEqual(row["family_heads"], 1)
+        self.assertEqual(saves.family_heads(view), {ss.LINUX: [linux["id"]],
+                                                    ss.MAC: [mac["id"]]})
+
+    def test_a_restore_stays_in_its_os(self):
+        old_mac = self.play_os("imac", "mac", b"m1")
+        new_mac = self.play_os("imac", "mac", b"m2")
+        linux = self.play_os("ubuntu", "linux", b"l")
+        view = saves.Catalog(self.store).view(self.key())
+        made = saves.restore(self.store, view, old_mac["id"])
+        self.assertEqual(made["os"], ss.MAC)
+        self.assertEqual(made["parents"], [new_mac["id"]])      # no Linux parent
+        after = ss.read_game(self.store, made["game"])
+        families = dict(ss.view_families(after))
+        self.assertEqual(families[ss.MAC].heads, [made["id"]])
+        self.assertEqual(families[ss.LINUX].heads, [linux["id"]])
+        # Linux devices go on as before: nothing for them to restore.
+        self.assertEqual(ss.decide(after, linux["id"], ss.save_hashes(linux), "ubuntu",
+                                   family=ss.LINUX), (ss.LAUNCH, None))
+
+    def test_the_current_save_of_one_os_is_not_restorable_again(self):
+        self.play_os("ubuntu", "linux", b"l")
+        mac = self.play_os("imac", "mac", b"m")
+        view = saves.Catalog(self.store).view(self.key())
+        with self.assertRaises(saves.SavesError) as caught:
+            saves.restore(self.store, view, mac["id"])
+        self.assertIn("macOS", str(caught.exception))
+
+    def test_settle_is_within_one_os(self):
+        self.play_os("ubuntu", "linux", b"l")
+        mac = self.play_os("imac", "mac", b"m")
+        view = saves.Catalog(self.store).view(self.key())
+        with self.assertRaises(saves.SavesError):
+            # A Linux head and a Mac head are not two saves to choose between.
+            saves.restore(self.store, view, mac["id"], settle=True)
+        other = self.play_os("macbook", "mac", b"m2")
+        view = saves.Catalog(self.store).view(self.key())
+        made = saves.restore(self.store, view, other["id"], settle=True)
+        self.assertEqual(made["parents"], sorted([mac["id"], other["id"]]))
+        self.assertEqual(made["os"], ss.MAC)
+
+    def test_legacy_snapshots_show_the_os_their_paths_say(self):
+        # helpers.play's saves are drive-C: Windows, with or without the field.
+        first = self.play("deck", b"one")
+        view = saves.Catalog(self.store).view(ss.game_key(GAME))
+        self.assertEqual(saves.history(view)[0]["os"], ss.WINDOWS)
+        legacy = ss.make_manifest(GAME, "pc1", list(first["files"]), [first["id"]])
+        self.assertNotIn("os", legacy)
+        legacy["merge_only"] = True             # its blobs are already there
+        ss.commit(self.store, legacy, "")
+        view = saves.Catalog(self.store).view(ss.game_key(GAME))
+        rows = {row["id"]: row for row in saves.history(view)}
+        self.assertEqual(rows[legacy["id"]]["os"], ss.WINDOWS)
+        self.assertTrue(rows[legacy["id"]]["head"])
+
+
 class Zip(helpers.StoreCase):
     def test_zip_holds_the_snapshot(self):
         manifest = self.play("deck", b"the save bytes")

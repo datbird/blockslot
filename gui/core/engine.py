@@ -8,20 +8,36 @@ import hashlib
 import os
 import shutil
 import subprocess
+import sys
+from pathlib import Path
 
 from . import paths
 
-# The ludusavi release a Windows PC downloads when it has none: the same
-# version decky/package.json pins for the Deck. The hash is the one GitHub
-# publishes for this asset, and it was checked against a download of it.
+# The ludusavi release a device downloads when it has none: the same version
+# decky/package.json pins for the Deck. Each hash is the one GitHub publishes
+# for that asset, and each was checked against a download of it.
 LUDUSAVI_VERSION = "0.31.0"
-LUDUSAVI_WINDOWS_URL = (
-    "https://github.com/mtkennerly/ludusavi/releases/download/v0.31.0/"
-    "ludusavi-v0.31.0-win64.zip")
+_RELEASE = "https://github.com/mtkennerly/ludusavi/releases/download/v0.31.0/"
+LUDUSAVI_WINDOWS_URL = _RELEASE + "ludusavi-v0.31.0-win64.zip"
 LUDUSAVI_WINDOWS_SHA256 = (
     "f47a8ad8c708f01d2eb124704973beffab205e292f5287a10fc4a101f8d68706")
 LUDUSAVI_WINDOWS_MEMBER = "ludusavi.exe"
+# Upstream publishes one Linux build, x86-64, and one Mac build, which is
+# arm64 only (a Mach-O for Apple silicon, checked in the tarball). So an Intel
+# Mac and an ARM Linux box have no official file to fetch: Rosetta runs Intel
+# code on Apple silicon, never the other way round.
+LUDUSAVI_ASSETS = {
+    ("windows", "x64"): (LUDUSAVI_WINDOWS_URL, LUDUSAVI_WINDOWS_SHA256),
+    ("linux", "x64"): (
+        _RELEASE + "ludusavi-v0.31.0-linux.tar.gz",
+        "7322ff45d41eae7ae064a80d8c9ecccc5b8fb6fc090a603a66369cd4b054068d"),
+    ("mac", "arm64"): (
+        _RELEASE + "ludusavi-v0.31.0-mac.tar.gz",
+        "5787e64d4c795180ab485535cae0b0ef6ee14d4fbe3813797a86913a37cc47f1"),
+}
 DOWNLOAD_TIMEOUT = 60
+# The manifest is ludusavi's list of where every game keeps its saves.
+MANIFEST_TIMEOUT = 120
 
 # The store library and the daemon travel with the engine and are installed
 # beside it: savepick imports them from its own folder.
@@ -86,13 +102,75 @@ def sha256_of(path):
     return digest.hexdigest()
 
 
-def download_ludusavi(url=LUDUSAVI_WINDOWS_URL, sha256=LUDUSAVI_WINDOWS_SHA256,
-                      say=None, opener=None):
-    """Fetch ludusavi's official Windows release, check it, and install it.
+class NoRelease(OSError):
+    """ludusavi publishes no build for this kind of machine."""
 
-    Only the pinned file is accepted: the zip has to hash to `sha256` before
-    anything is taken out of it. A ludusavi that is already there is never
-    replaced, and that is decided before anything is downloaded.
+
+def this_machine(system=None, machine=None, translated=None):
+    """("windows" | "linux" | "mac", "x64" | "arm64" | the raw name).
+
+    A Mac running an Intel python under Rosetta reports x86_64, but the
+    hardware is Apple silicon and runs the arm64 build natively, so the
+    kernel's own answer is asked for.
+    """
+    import platform
+    system = system or ("win32" if paths.is_windows() else sys.platform)
+    machine = (machine or platform.machine() or "").lower()
+    if system == "win32":
+        # Windows on ARM runs the x64 build through its own emulation.
+        return "windows", "x64"
+    kind = "mac" if system == "darwin" else "linux"
+    if machine in ("x86_64", "amd64", "x64"):
+        arch = "x64"
+    elif machine in ("arm64", "aarch64"):
+        arch = "arm64"
+    else:
+        arch = machine
+    if kind == "mac" and arch == "x64":
+        if translated is None:
+            translated = _rosetta()
+        if translated:
+            arch = "arm64"
+    return kind, arch
+
+
+def _rosetta():
+    try:
+        done = subprocess.run(["sysctl", "-n", "sysctl.proc_translated"],
+                              capture_output=True, text=True, timeout=10)
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return done.stdout.strip() == "1"
+
+
+def ludusavi_asset(kind=None):
+    """(url, sha256) of the official release for this machine.
+
+    Raises NoRelease with a sentence a person can act on.
+    """
+    kind = kind or this_machine()
+    found = LUDUSAVI_ASSETS.get(kind)
+    if found:
+        return found
+    system, arch = kind
+    if system == "mac":
+        raise NoRelease("ludusavi publishes its Mac build for Apple silicon "
+                        "only, and this Mac is Intel. Install ludusavi %s or "
+                        "newer yourself, at %s."
+                        % (LUDUSAVI_VERSION, paths.ludusavi_path()))
+    raise NoRelease("ludusavi publishes no %s build for %s. Install ludusavi "
+                    "%s or newer yourself, at %s."
+                    % (system.title(), arch, LUDUSAVI_VERSION,
+                       paths.ludusavi_path()))
+
+
+def download_ludusavi(url=None, sha256=None, say=None, opener=None):
+    """Fetch ludusavi's official release for this machine, check it, and
+    install it. With no `url`, ludusavi_asset picks the file and its hash.
+
+    Only the pinned file is accepted: the archive has to hash to `sha256`
+    before anything is taken out of it. A ludusavi that is already there is
+    never replaced, and that is decided before anything is downloaded.
 
     `opener(url)` returns something with read(); the default is urllib over a
     verifying TLS context. `say` hears progress in plain words. Raises
@@ -102,6 +180,10 @@ def download_ludusavi(url=LUDUSAVI_WINDOWS_URL, sha256=LUDUSAVI_WINDOWS_SHA256,
     target = paths.ludusavi_path()
     if target.exists():
         raise AlreadyThere("ludusavi is already installed at %s" % target)
+    if url is None:
+        url, sha256 = ludusavi_asset()
+    if not sha256:
+        raise ValueError("a ludusavi download needs the hash it is pinned to")
     target.parent.mkdir(parents=True, exist_ok=True)
     download = target.parent / "ludusavi-download.blockslot.tmp"
     say("Downloading ludusavi %s ..." % LUDUSAVI_VERSION)
@@ -109,8 +191,8 @@ def download_ludusavi(url=LUDUSAVI_WINDOWS_URL, sha256=LUDUSAVI_WINDOWS_SHA256,
         try:
             response = (opener or _open)(url)
         except OSError as exc:
-            raise OSError("Could not download ludusavi. Check that this PC "
-                          "is online. (%s)" % _reason(exc))
+            raise OSError("Could not download ludusavi. Check that this "
+                          "device is online. (%s)" % _reason(exc))
         got = 0
         with response, open(str(download), "wb") as out:
             while True:
@@ -132,6 +214,59 @@ def download_ludusavi(url=LUDUSAVI_WINDOWS_URL, sha256=LUDUSAVI_WINDOWS_SHA256,
             download.unlink()
     say("Installed ludusavi at %s" % target)
     return target
+
+
+def ludusavi_config_dir(binary=None):
+    """Where the engine's ludusavi keeps its config and manifest.
+
+    ludusavi's own rule, as seen by the engine: beside the binary when it runs
+    portable, else the platform's config folder, which for a Steam snap is
+    inside the snap's home (savepick.ludusavi_config_dir, from the inside).
+    """
+    binary = Path(binary or paths.ludusavi_path())
+    if (binary.parent / "ludusavi.portable").is_file():
+        return binary.parent
+    if paths.is_windows():
+        return Path(os.environ.get("APPDATA") or str(paths.home())) / "ludusavi"
+    if paths.is_mac():
+        return paths.home() / "Library" / "Application Support" / "ludusavi"
+    sandbox = paths.steam_sandbox_home()
+    if sandbox is not None:
+        return sandbox / ".config" / "ludusavi"
+    base = os.environ.get("XDG_CONFIG_HOME") or str(paths.home() / ".config")
+    return Path(base) / "ludusavi"
+
+
+def update_ludusavi_manifest(say=None, run=None):
+    """Download ludusavi's manifest, the list of where each game saves.
+
+    The engine only ever runs ludusavi with --no-manifest-update, so that a
+    launch never waits on the network. A ludusavi that has never fetched it
+    knows no game at all. True once the manifest is there.
+    """
+    say = say or (lambda _text: None)
+    binary = paths.ludusavi_path()
+    folder = ludusavi_config_dir(binary)
+    command = [str(binary)]
+    if paths.steam_sandbox_home() is not None:
+        # This window runs outside the snap, where ludusavi would read and
+        # write the real home's config. The engine's copy is inside it.
+        command += ["--config", str(folder)]
+    command += ["manifest", "update", "--force"]
+    say("Downloading ludusavi's list of games ...")
+    try:
+        done = (run or subprocess.run)(
+            command, capture_output=True, text=True, timeout=MANIFEST_TIMEOUT,
+            stdin=subprocess.DEVNULL, **paths.no_window())
+    except (OSError, subprocess.SubprocessError) as exc:
+        say("Could not download ludusavi's list of games: %s" % exc)
+        return False
+    if done.returncode != 0 or not (folder / "manifest.yaml").is_file():
+        say("Could not download ludusavi's list of games. The first game "
+            "you start will try again.")
+        return False
+    say("ludusavi's list of games is in place.")
+    return True
 
 
 def _open(url):

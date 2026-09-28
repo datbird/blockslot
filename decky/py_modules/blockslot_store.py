@@ -152,8 +152,13 @@ def candidate_games(state, ss, extra=()):
     return [seen[key] for key in sorted(seen)]
 
 
-def list_forks(store, state, ss, extra=()):
-    """Every candidate game with more than one head.
+def list_forks(store, state, ss, extra=(), device=None):
+    """Every candidate game with more than one head in this device's OS history.
+
+    Each OS family keeps its own history of a game (slotstore, "operating
+    systems"), so two saves on a Mac are not a choice the Deck can make, and
+    the Deck would restore neither. The family is the one this device plays
+    the game as: its own snapshots say, else this machine's OS.
 
     Returns {"forks": [...], "error": text or None}. Stops at the first store
     failure: an offline store would fail the same way for every game, and the
@@ -165,6 +170,8 @@ def list_forks(store, state, ss, extra=()):
             view = ss.read_game(store, game, cache_dir=state.cache_dir)
         except ss.StoreError as exc:
             return {"forks": forks, "error": str(exc)}
+        family = ss.device_family(view, device or "", state.base(game)) or ss.host_family()
+        view = ss.family_view(view, family)
         heads = view.heads
         if len(heads) < 2:
             continue
@@ -476,7 +483,7 @@ class Host(object):
             store, state = self._reader()
         except Exception as exc:
             return {"forks": [], "error": str(exc)}
-        return list_forks(store, state, self.ss, extra)
+        return list_forks(store, state, self.ss, extra, device=self.device)
 
     def choose(self, game, snap_id):
         worker = self.worker()

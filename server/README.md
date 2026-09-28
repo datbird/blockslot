@@ -1,6 +1,6 @@
 # BlockSlot server
 
-BlockSlot keeps game saves in step between your PCs and your Steam Deck
+BlockSlot keeps game saves in step between your PCs, Macs and Steam Deck
 ([the project](../README.md)). Each
 device uploads a save when a game closes and restores the newest one before a
 game starts. This server is where the saves live, and the web page where you
@@ -10,7 +10,7 @@ One container holds all of it:
 
 - **Garage**, a small S3 store, on port 3900. Devices upload saves here.
 - **The BlockSlot web UI** on port 8761:
-  - every game on the store, with its history;
+  - every game on the store, with its history, each save marked with its OS;
   - restore an older save, settle two saves, download any save as a zip;
   - the settings every device shares;
   - device keys;
@@ -87,6 +87,16 @@ Back up `/data` as a whole. `meta/` and `data/` hold every save.
 | ![A game's history](docs/images/02-game-history.png) | ![Two saves](docs/images/03-two-saves.png) |
 | ![Library games](docs/images/04-library.png) | ![Settings](docs/images/05-settings.png) |
 | ![Devices](docs/images/06-devices.png) | ![Storage](docs/images/07-storage.png) |
+
+## Each OS keeps its own history
+
+A game's Windows, Linux and Mac builds save different files in different
+places, so each OS has its own history of the game. Every save shows its OS
+(Windows, Linux or macOS). "Two saves" means two within one OS, and each OS
+gets its own panel to settle them. Restoring or settling a save stays within
+that save's OS: only devices of that OS restore it. A Windows game under
+Proton on the Deck counts as Windows. Emulator library games belong to every
+OS and carry no label.
 
 ## Settings every device shares
 

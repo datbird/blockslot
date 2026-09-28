@@ -6,12 +6,19 @@ moves between them. A list keeps its own up and down, and hands focus on when
 the cursor runs off the end.
 """
 
+import queue
+import sys
+import threading
 import tkinter as tk
 import tkinter.font as tkfont
 
+from ..core import uiscale
 from . import theme, widgets
 
 TITLE = "BlockSlot"
+
+# How often the Tk thread collects what the workers posted (App.post).
+POST_POLL_MS = 40
 
 
 class NavRail(tk.Canvas):
@@ -23,7 +30,12 @@ class NavRail(tk.Canvas):
         self.on_select = on_select
         self.active = items[0][0] if items else None
         self.cursor = 0
-        tk.Canvas.__init__(self, parent, width=metrics.nav_width, bg=theme.PANEL,
+        # Wide enough for its longest label, measured: a fixed width is what
+        # read "BlockS" once the text was bigger than the width expected.
+        widest = max([widgets.width_of(label, metrics.font(bold=True))
+                      for _key, label in items] or [0])
+        width = max(metrics.nav_width, int(widest + metrics.pad * 3.4))
+        tk.Canvas.__init__(self, parent, width=width, bg=theme.PANEL,
                            highlightthickness=0, bd=0, takefocus=1)
         self.bind("<Configure>", lambda event: self.redraw())
         self.bind("<FocusIn>", lambda event: self.redraw())
@@ -174,14 +186,18 @@ class App(tk.Tk):
         self.title(TITLE)
         self.configure(bg=theme.BG)
         self._set_icon()
-        width, height = size
-        if fullscreen:
-            width = self.winfo_screenwidth()
-            height = self.winfo_screenheight()
+        # size is at 100 percent. The window, and every pixel size in it, is
+        # grown by the display's scale, as its fonts already are.
+        self.ui_scale = uiscale.for_window(self)
+        screen = (self.winfo_screenwidth(), self.winfo_screenheight())
+        width, height = uiscale.window_size(size, self.ui_scale, screen,
+                                            fullscreen)
         self.geometry("%dx%d" % (width, height))
-        self.minsize(960, 600)
+        self.minsize(min(int(960 * self.ui_scale), width),
+                     min(int(600 * self.ui_scale), height))
         theme.pick_fonts(tkfont.families(self))
-        self.metrics = theme.Metrics(height, width)
+        self.metrics = theme.Metrics(height / self.ui_scale,
+                                     width / self.ui_scale, dpi=self.ui_scale)
         if fullscreen:
             try:
                 self.attributes("-fullscreen", True)
@@ -191,6 +207,10 @@ class App(tk.Tk):
         self.screens = {}
         self.current = None
         self.nav = None
+        self._tk_thread = threading.get_ident()
+        self._inbox = queue.Queue()
+        self._pump_id = None
+        self._pump()
         self.content = tk.Frame(self, bg=theme.BG)
         self.footer = Footer(self, self.metrics)
         self._build_layout()
@@ -361,6 +381,58 @@ class App(tk.Tk):
         except tk.TclError:
             pass
 
+    def destroy(self):
+        if self._pump_id is not None:
+            try:
+                self.after_cancel(self._pump_id)
+            except tk.TclError:
+                pass
+            self._pump_id = None
+        tk.Tk.destroy(self)
+
+    # ------------------------------------------------------------ threads
+
+    def post(self, callback, *args):
+        """Run callback(*args) on the Tk thread. Safe from any thread.
+
+        A worker must never call Tk itself, not even after(). With a threaded
+        Tcl, after() from another thread is marshalled to the Tk thread and
+        waits there until its event loop wakes, and on macOS that loop is not
+        woken by it: the call sat until the next mouse event, so a finished
+        job left its panel on screen until someone clicked. A plain queue
+        touches no Tk, and the Tk thread empties it on a timer of its own.
+        """
+        if threading.get_ident() == self._tk_thread:
+            try:
+                self.after(0, callback, *args)
+            except (RuntimeError, tk.TclError):
+                pass
+            return
+        self._inbox.put((callback, args))
+
+    def _pump(self):
+        self._pump_id = None
+        self.drain_posts()
+        try:
+            self._pump_id = self.after(POST_POLL_MS, self._pump)
+        except tk.TclError:
+            pass
+
+    def drain_posts(self):
+        """Run everything the workers posted. Tk thread only."""
+        while True:
+            try:
+                callback, args = self._inbox.get_nowait()
+            except queue.Empty:
+                return
+            try:
+                callback(*args)
+            except tk.TclError:
+                # A panel or screen that was closed while the job ran.
+                pass
+            except Exception:
+                self.report_callback_exception(*sys.exc_info())
+
     # ------------------------------------------------------------ overlays
 
     def _overlay(self, title, message):
@@ -499,22 +571,39 @@ class App(tk.Tk):
         log.pack(fill="both", expand=True, padx=self.metrics.pad * 2,
                  pady=(0, self.metrics.pad * 2))
         log.configure(state="disabled")
-        return BusyPanel(self, frame, body, log)
+        return BusyPanel(self, frame, body, log, panel)
 
 
 class BusyPanel(object):
-    """The handle a worker uses to say what it is doing."""
+    """The handle a worker uses to say what it is doing.
 
-    def __init__(self, app, frame, body, log):
+    Every public method is safe from a worker thread: each one only posts to
+    the Tk thread (App.post), and the work happens there.
+    """
+
+    # How long a job that worked leaves its last line up before the panel
+    # goes. One that failed stays until it is dismissed.
+    LINGER_MS = 1600
+
+    def __init__(self, app, frame, body, log, panel=None):
         self.app = app
         self.frame = frame
         self.body = body
         self.log = log
+        self.panel = panel
         self.closed = False
 
     def say(self, text):
-        """Safe to call from a worker thread."""
-        self.app.after(0, self._say, text)
+        self.app.post(self._say, text)
+
+    def finish(self, text, ok=True, then=None):
+        """The job is over: show how it went, then take the panel down.
+
+        A job that worked closes by itself after a moment. One that failed
+        keeps its reason up, with a Close button, so it is read before it
+        goes. `then` runs on the Tk thread once the panel is down.
+        """
+        self.app.post(self._finish, text, ok, then)
 
     def _say(self, text):
         if self.closed:
@@ -528,10 +617,28 @@ class BusyPanel(object):
         except tk.TclError:
             pass
 
-    def close(self):
-        self.app.after(0, self._close)
+    def _finish(self, text, ok, then):
+        self._say(text)
+        if ok or self.panel is None:
+            self.app.after(self.LINGER_MS, self._close, then)
+            return
+        try:
+            row = tk.Frame(self.panel, bg=theme.PANEL)
+            row.pack(side="bottom", fill="x", padx=self.app.metrics.pad * 2,
+                     pady=(0, self.app.metrics.pad * 1.5), before=self.log)
+            button = widgets.Button(row, self.app.metrics, "Close",
+                                    kind="primary",
+                                    command=lambda: self._close(then))
+            button.pack(side="right")
+            self.frame.bind_all("<Escape>", lambda event: self._close(then))
+            button.focus_set()
+        except tk.TclError:
+            self._close(then)
 
-    def _close(self):
+    def close(self):
+        self.app.post(self._close)
+
+    def _close(self, then=None):
         if self.closed:
             return
         self.closed = True
@@ -539,4 +646,10 @@ class BusyPanel(object):
             self.frame.destroy()
         except tk.TclError:
             pass
-        self.app.focus_first()
+        try:
+            self.app._bind_keys()
+            self.app.focus_first()
+        except tk.TclError:
+            pass
+        if then is not None:
+            then()

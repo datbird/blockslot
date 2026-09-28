@@ -283,22 +283,15 @@ class GamesScreen(app_mod.Screen):
         except Exception:
             newest, key = {}, None
         self._hub_key = key
-        try:
-            self.app.after(0, self._backups_ready, newest)
-        except Exception:
-            pass
+        self.app.post(self._backups_ready, newest)
 
     def _backups_worker(self, binary):
         try:
             newest = backups.newest_everywhere(binary)
         except Exception:
             newest = {}
-        try:
-            self.app.after(0, self._backups_ready, newest)
-        except Exception:
-            # The window closed while ludusavi was still answering. Nothing
-            # to hand the answer to, and nothing worth saying about it.
-            pass
+        # If the window closed meanwhile, the answer is never collected.
+        self.app.post(self._backups_ready, newest)
 
     def _backups_ready(self, newest):
         self._newest = newest
@@ -362,9 +355,10 @@ class GamesScreen(app_mod.Screen):
             self.borderless_button.configure_text(
                 "Make borderless" if making else "Remove borderless")
         if not count:
-            self.status.configure(text="Space ticks the game under the cursor")
+            self.status.configure(text="Space ticks the game under the cursor",
+                                  fg=theme.TEXT_DIM)
         else:
-            self.status.configure(text="%d picked" % count)
+            self.status.configure(text="%d picked" % count, fg=theme.TEXT_DIM)
 
     def _show_details(self, row):
         lines = [
@@ -401,10 +395,27 @@ class GamesScreen(app_mod.Screen):
             tree = self._tree_for(rows)
             if tree is False:
                 return
-        steam_changes, shortcut_changes = self.library.plan(
-            [row.appid for row in rows], enable, tree=tree)
+        planned = self._planned(lambda: self.library.plan(
+            [row.appid for row in rows], enable, tree=tree))
+        if planned is None:
+            return
+        steam_changes, shortcut_changes = planned
         verb = "Add to BlockSlot" if enable else "Remove from BlockSlot"
         self._confirm_and_write(rows, verb, steam_changes, shortcut_changes)
+
+    def _planned(self, make):
+        """The plan, or None after saying why there is none.
+
+        A Mac running from source with only the /usr/bin/python3 stub has
+        no python a launch option could name (paths.NoRealPython).
+        """
+        try:
+            return make()
+        except paths.NoRealPython as exc:
+            text = str(exc)
+            self.app.confirm("No python to name", text[:1].upper() + text[1:],
+                             ok_label="Close", cancel_label="", kind="normal")
+            return None
 
     @staticmethod
     def _borderless_target(rows):
@@ -420,8 +431,11 @@ class GamesScreen(app_mod.Screen):
         if not rows:
             return
         enable = self._borderless_target(rows)
-        steam_changes, shortcut_changes = self.library.plan_borderless(
-            [row.appid for row in rows], enable)
+        planned = self._planned(lambda: self.library.plan_borderless(
+            [row.appid for row in rows], enable))
+        if planned is None:
+            return
+        steam_changes, shortcut_changes = planned
         verb = "Make borderless" if enable else "Remove borderless"
         note = ("Set each game to windowed in its own options. BlockSlot "
                 "takes the frame off the window and fits it to the screen. "
@@ -447,9 +461,9 @@ class GamesScreen(app_mod.Screen):
             % (names, note))
         if paths.engine_in_exe() and paths.in_temporary_place():
             message = ("Careful: BlockSlot is running from a temporary "
-                       "folder, and these games will point at %s. Move "
-                       "Blockslot.exe somewhere it can stay first.\n\n"
-                       % paths.launch_program()) + message
+                       "folder, and these games will point at %s. %s\n\n"
+                       % (paths.launch_program(), paths.temporary_advice())
+                       ) + message
         if not self.app.confirm(verb, message, ok_label="Close Steam and do it"):
             return
         panel = self.app.busy(verb, "Working ...")
@@ -490,6 +504,8 @@ class GamesScreen(app_mod.Screen):
         return chosen if chosen else False
 
     def _worker(self, panel, steam_changes, shortcut_changes):
+        """Runs on its own thread, so it never touches Tk: panel only posts."""
+        ok = False
         try:
             count = launchopts.with_steam_closed(
                 self.library.root,
@@ -497,11 +513,15 @@ class GamesScreen(app_mod.Screen):
                                           self.library.user_id),
                 lambda: self.library.apply(steam_changes, shortcut_changes),
                 panel.say)
-            panel.say("Changed %d game%s." % (count, "" if count == 1 else "s"))
+            text = "Changed %d game%s." % (count, "" if count == 1 else "s")
+            ok = True
         except launchopts.SteamStayedOpen as exc:
-            panel.say(str(exc))
+            text = str(exc)
         except Exception as exc:
-            panel.say("Stopped: %s" % exc)
-        time.sleep(1.6)
-        panel.close()
-        self.app.after(0, self.refresh)
+            text = "Stopped: %s" % exc
+        panel.finish(text, ok, then=lambda: self._finished(text, ok))
+
+    def _finished(self, text, ok):
+        """The panel is down: show the games as they are now, and the result."""
+        self.refresh()
+        self.status.configure(text=text, fg=theme.TEXT_DIM if ok else theme.WARN)

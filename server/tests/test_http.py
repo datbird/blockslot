@@ -188,6 +188,9 @@ class Http(helpers.StoreCase):
         self.assertEqual(body["games"][0]["title"], GAME)
         status, game = client.call("GET", "/api/games/%s" % key)
         self.assertEqual(len(game["history"]), 2)
+        # Each save says its OS, and the heads are grouped by OS.
+        self.assertEqual({row["os"] for row in game["history"]}, {ss.WINDOWS})
+        self.assertEqual(list(game["families"]), [ss.WINDOWS])
         status, made = client.call("POST", "/api/games/%s/restore" % key, {"snapshot": old["id"]})
         self.assertEqual(status, 200)
         self.assertEqual(ss.read_game(self.store, GAME).heads, [made["id"]])

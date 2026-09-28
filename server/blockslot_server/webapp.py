@@ -449,9 +449,11 @@ class App(object):
         view = self.catalog.view(game_dir, refresh=refresh)
         if view is None:
             raise HttpError(404, "That game is not on the store.")
-        head = view.newest_head()
+        systems = saves.family_summary(view)
+        head = max(systems, key=lambda row: row["when"] or "")["head"]
         info = saves.describe_game(game_dir, view.manifests[head])
-        info.update({"heads": view.heads, "uploading": sorted(view.pending),
+        info.update({"heads": saves.all_heads(view), "families": saves.family_heads(view),
+                     "systems": systems, "uploading": sorted(view.pending),
                      "history": saves.history(view)})
         return info
 

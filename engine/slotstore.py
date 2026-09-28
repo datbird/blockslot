@@ -192,8 +192,13 @@ def scan_dir(root):
 
 
 def make_manifest(game, device, files, parents, played=None, mode="game",
-                  created=None):
-    """A manifest dict, with its id worked out from its own content."""
+                  created=None, os_family=None):
+    """A manifest dict, with its id worked out from its own content.
+
+    `os_family` is the OS history the snapshot belongs to (see "operating
+    systems" below). Left out, the manifest has no "os" field and its family
+    is read from its paths, as for every snapshot made before the field.
+    """
     created = created or utc_now()
     body = {
         "format": FORMAT,
@@ -205,6 +210,8 @@ def make_manifest(game, device, files, parents, played=None, mode="game",
         "played": played or {},
         "files": files,
     }
+    if os_family:
+        body["os"] = os_family
     digest = sha256_bytes(canonical_json(body))
     body["id"] = snap_id_for(created, device, digest)
     return body
@@ -230,6 +237,238 @@ def save_hashes(manifest):
             continue
         out.add(record["sha256"])
     return out
+
+
+# ------------------------------------------------------------------ operating systems
+#
+# EACH OPERATING SYSTEM KEEPS ITS OWN HISTORY OF A GAME
+#
+# A game's save is not always the same file on every OS. Getting Over It
+# writes a plist on a Mac and a Unity prefs file on Linux, and ludusavi
+# cannot restore one where the other belongs: on 2026-09-28 a Mac tried to
+# write the Linux path, failed twice (os error 45), and told the player the
+# restore did not finish. So every snapshot of a game says which OS family
+# it was made for, and a device only restores, forks on, and waits for the
+# snapshots of its own family.
+#
+# The family is the OS of the BUILD OF THE GAME that ran, not the host's.
+# A Windows game running under Proton or Wine on the Steam Deck or a Linux
+# desktop is a Windows game: its save lives in a Wine prefix (drive_c), and
+# ludusavi translates that prefix to and from real Windows paths. That is
+# the proven Deck <-> Windows PC round trip of Dark Souls II, and it stays one
+# history. The Deck and a Linux desktop running native builds are both
+# "linux" and share one history.
+#
+# Snapshots made before this field existed have none. Their family is read
+# from the paths they hold, which is what ludusavi itself recorded: a
+# drive letter or a Wine prefix is Windows, a POSIX path under /Users is a
+# Mac, any other POSIX path is Linux. A snapshot with no ludusavi paths at
+# all (an emulator library, a save set) belongs to every family, as does a
+# library game made now: emulator saves are the same file on every OS.
+#
+# A later change can let a game whose save files are identical on every OS
+# share one history, by stamping ANY on its snapshots (make_manifest's
+# os_family) and viewing it with family None. Nothing here assumes there
+# are only three histories.
+
+WINDOWS = "windows"
+LINUX = "linux"
+MAC = "mac"
+FAMILIES = (WINDOWS, LINUX, MAC)
+ANY = "any"
+FAMILY_NAMES = {WINDOWS: "Windows", LINUX: "Linux", MAC: "macOS", ANY: "every OS"}
+
+_WINE_SEGMENT = re.compile(r"(^|/)drive_c(/|$)", re.I)
+_WINDOWS_DRIVE_PATH = re.compile(r"^[A-Za-z]:([/\\]|$)")
+_BACKUP_DRIVE = re.compile(r"(^|/)drive-([A-Za-z]|0)/(.*)$")
+_MAC_ROOTS = ("Users/", "Library/", "Applications/", "Volumes/", "System/", "private/")
+
+
+def host_family(platform=None):
+    """The OS family of this machine."""
+    platform = platform or sys.platform
+    if platform == "win32" or platform.startswith("cygwin"):
+        return WINDOWS
+    if platform == "darwin":
+        return MAC
+    return LINUX
+
+
+def family_name(family):
+    return FAMILY_NAMES.get(family or ANY, family)
+
+
+def path_is_wine(path):
+    """True for a path inside a Wine or Proton prefix (its drive_c)."""
+    return bool(_WINE_SEGMENT.search((path or "").replace("\\", "/")))
+
+
+def paths_family(paths, platform=None):
+    """The family of save files by their real paths on this device.
+
+    A Wine prefix or a drive letter is Windows whatever the host is; any
+    other path is the host's own. None when there are no paths at all.
+    """
+    paths = [p for p in paths or [] if p]
+    if not paths:
+        return None
+    if any(path_is_wine(p) or _WINDOWS_DRIVE_PATH.match(p) for p in paths):
+        return WINDOWS
+    return host_family(platform)
+
+
+def _backup_path_family(rel):
+    """The family of one path inside a ludusavi backup, or None."""
+    found = _BACKUP_DRIVE.search(rel)
+    if not found:
+        return None
+    drive, rest = found.group(2), found.group(3)
+    if drive != "0":
+        return WINDOWS
+    if path_is_wine(rest):
+        return WINDOWS
+    if rest.startswith(_MAC_ROOTS):
+        return MAC
+    return LINUX
+
+
+def manifest_family(manifest):
+    """Which OS family's history a snapshot belongs to: FAMILIES or ANY."""
+    manifest = manifest or {}
+    stated = manifest.get("os")
+    if stated:
+        return stated
+    if (manifest.get("mode") or "game") != "game":
+        return ANY
+    found = set()
+    for record in manifest.get("files") or []:
+        if record["path"].rsplit("/", 1)[-1] in METADATA_NAMES:
+            continue
+        family = _backup_path_family(record["path"])
+        if family:
+            found.add(family)
+    if len(found) == 1:
+        return found.pop()
+    # Nothing ludusavi-shaped, or a mix no single OS wrote: shown to all,
+    # which is what every snapshot was before families existed.
+    return ANY
+
+
+def _yaml_key(line):
+    key = line.strip()[:-1].strip()
+    if len(key) >= 2 and key[0] == key[-1] == '"':
+        key = key[1:-1].replace('\\"', '"').replace("\\\\", "\\")
+    return key
+
+
+def mapping_family(text):
+    """The family of a ludusavi backup, from its mapping.yaml text, or None.
+
+    ludusavi writes `os:` for each backup. A backup made on Linux or a Mac
+    whose every file lies in a Wine prefix (a `semantics` directory of kind
+    wine, or a drive_c path) is a Windows game's save, and is Windows.
+    """
+    systems = set()
+    wine_dirs = []
+    files = []
+    section, section_indent, pending_dir = None, -1, None
+    for line in (text or "").splitlines():
+        if not line.strip():
+            continue
+        indent = len(line) - len(line.lstrip(" "))
+        stripped = line.strip()
+        if section and indent <= section_indent:
+            section, pending_dir = None, None
+        if section == "directories":
+            if indent == section_indent + 2 and stripped.endswith(":"):
+                pending_dir = _yaml_key(line)
+            elif pending_dir and re.match(r"^kind:\s*\"?wine\"?$", stripped):
+                wine_dirs.append(pending_dir.replace("\\", "/").rstrip("/") + "/")
+            continue
+        if section == "files":
+            if indent == section_indent + 2 and stripped.endswith(":"):
+                files.append(_yaml_key(line).replace("\\", "/"))
+            continue
+        found = re.match(r"^(?:- )?os:\s*\"?([A-Za-z]+)\"?$", stripped)
+        if found:
+            systems.add(found.group(1).lower())
+        elif stripped in ("directories:", "files:"):
+            section, section_indent = stripped[:-1], indent
+    if WINDOWS in systems:
+        return WINDOWS
+    if files and all(path_is_wine(f) or _WINDOWS_DRIVE_PATH.match(f)
+                     or any(f.startswith(d) for d in wine_dirs) for f in files):
+        return WINDOWS
+    known = [s for s in systems if s in FAMILIES]
+    if len(known) == 1:
+        return known[0]
+    return None
+
+
+def backup_family(folder):
+    """The family of a ludusavi backup folder, from its mapping.yaml, or None."""
+    found = set()
+    for base, _dirs, names in os.walk(folder):
+        if "mapping.yaml" not in names:
+            continue
+        try:
+            with open(os.path.join(base, "mapping.yaml"), "r", encoding="utf-8") as handle:
+                family = mapping_family(handle.read())
+        except (OSError, ValueError):
+            family = None
+        if family:
+            found.add(family)
+    return found.pop() if len(found) == 1 else None
+
+
+def in_family(family, wanted):
+    """True when a snapshot of `family` belongs in the history of `wanted`.
+
+    `wanted` None or ANY is every history, used where no one OS is asking.
+    """
+    return wanted in (None, ANY) or family in (ANY, wanted)
+
+
+def family_view(view, family):
+    """The part of a game's history one OS family plays: its own snapshots
+    and the ones every family shares. Heads, forks and pending uploads are
+    then worked out within that part alone."""
+    if view is None or family in (None, ANY):
+        return view
+    manifests = {sid: m for sid, m in view.manifests.items()
+                 if in_family(manifest_family(m), family)}
+    pending = {sid: intent for sid, intent in view.pending.items()
+               if in_family((intent or {}).get("os") or ANY, family)}
+    return GameView(view.game, manifests, pending)
+
+
+def view_families(view):
+    """[(family, GameView)] for every history a game has, definite families
+    first. A game whose snapshots all belong to every family has one, ANY."""
+    families = sorted(set(manifest_family(m) for m in view.manifests.values()) - {ANY})
+    if not families:
+        return [(ANY, view)]
+    return [(family, family_view(view, family)) for family in families]
+
+
+def device_family(view, device, base=None):
+    """The family this device plays a game as, from its own history, or None.
+
+    Its newest own snapshot of a definite family says it; failing that, the
+    base it last restored or uploaded. None means no evidence either way.
+    """
+    me = device_key(device)
+    own = [sid for sid, m in view.manifests.items()
+           if (m.get("device") or snap_device(sid)) == me
+           and manifest_family(m) != ANY]
+    if own:
+        newest = max(own, key=lambda sid: (view.sort_time(sid), sid))
+        return manifest_family(view.manifests[newest])
+    if base and base in view.manifests:
+        family = manifest_family(view.manifests[base])
+        if family != ANY:
+            return family
+    return None
 
 
 # ------------------------------------------------------------------ stores
@@ -867,7 +1106,9 @@ def commit(store, manifest, data_dir, progress=None, known=None):
     intent = {"id": snap_id, "device": manifest["device"],
               "created": manifest["created"], "parents": manifest["parents"],
               "files": len(manifest["files"]),
-              "bytes": sum(r["size"] for r in manifest["files"])}
+              "bytes": sum(r["size"] for r in manifest["files"]),
+              # So a device of another OS does not wait on this upload.
+              "os": manifest_family(manifest)}
     store.put(pending_key(game, snap_id), manifest_bytes(intent))
 
     total = sum(record["size"] for record in manifest["files"]) or 1
@@ -1018,16 +1259,26 @@ WAIT = "wait"                # another device is still uploading a newer save
 UNKNOWN = "unknown"          # the store could not be read
 
 
-def decide(view, base, local_hashes, device):
+def decide(view, base, local_hashes, device, family=None):
     """The launch decision, from lineage rather than clocks.
 
     `local_hashes` are the hashes of the save files on this device now (see
     save_hashes). Returns (action, detail): the head to restore, the heads to
     choose between, or the pending markers to wait for. LAUNCH with a detail
     means "the save here already is that snapshot; adopt it as the base".
+
+    `family` is the OS family this device plays the game as. Only that
+    family's history counts: a newer save made for another OS is not newer
+    here, it is another game's file (see "operating systems" above).
     """
     if view is None:
         return UNKNOWN, None
+    whole, view = view, family_view(view, family)
+    if base is not None and base in whole.manifests and base not in view.manifests:
+        # A base from another OS's history says nothing about this one. It
+        # happens once, on a device that took the other OS's save before
+        # there were families.
+        base = None
     heads = view.heads
     newest_known = max([view.sort_time(h) for h in heads] or [0])
     others_pending = {sid: intent for sid, intent in view.pending.items()
@@ -1181,11 +1432,16 @@ class LocalState(object):
         return parents + self.merge(game)
 
     def stage(self, game, device, source_dir, played=None, mode="game",
-              parents=None, created=None, unit=None):
+              parents=None, created=None, unit=None, os_family=None):
         """Copy a backup into the queue and fsync it. Returns the manifest.
 
         The copy is what gets uploaded, so a game started again before the
         upload finishes cannot change what goes up.
+
+        A game's snapshot always says its OS family: `os_family` when the
+        caller knows which build ran, else what ludusavi's mapping.yaml says,
+        else what its paths say, else this machine's. A library game's
+        belongs to every family.
         """
         with self._lock:
             if parents is None:
@@ -1196,8 +1452,16 @@ class LocalState(object):
                 data = os.path.join(work, "data")
                 shutil.copytree(source_dir, data)
                 files = scan_dir(data)
+                if mode != "game":
+                    os_family = None
+                elif not os_family:
+                    from_paths = manifest_family({"mode": mode, "files": files})
+                    os_family = (backup_family(data)
+                                 or (from_paths if from_paths != ANY else None)
+                                 or host_family())
                 manifest = make_manifest(game, device, files, parents,
-                                         played=played, mode=mode, created=created)
+                                         played=played, mode=mode, created=created,
+                                         os_family=os_family)
                 if unit:
                     # Which library game this is, for display: not part of
                     # the id, so it never changes what "the same save" means.
@@ -1217,9 +1481,11 @@ class LocalState(object):
         on the store, so this costs one small manifest."""
         with self._lock:
             files = list(chosen["files"])
+            family = manifest_family(chosen)
             manifest = make_manifest(game, device, files, heads,
                                      played=chosen.get("played"),
-                                     mode=chosen.get("mode") or "game")
+                                     mode=chosen.get("mode") or "game",
+                                     os_family=None if family == ANY else family)
             os.makedirs(self.queue_dir, exist_ok=True)
             work = tempfile.mkdtemp(prefix=".stage-", dir=self.queue_dir)
             os.makedirs(os.path.join(work, "data"))
@@ -1477,12 +1743,14 @@ def import_backups(store, root, dry_run=False, progress=None, known=None):
     """Put every ludusavi backup in a Syncthing folder on the store.
 
     Each backup becomes a snapshot. Backups from one device chain in time
-    order. Where more than one device has backups of a game, a merge snapshot
-    of the newest one names every device's last snapshot as a parent, so the
-    game starts with one head instead of a fork nobody made.
+    order. Where more than one device has backups of a game for the same OS
+    family, a merge snapshot of the newest one names each of those devices'
+    last snapshots as a parent, so each OS's history starts with one head
+    instead of a fork nobody made.
 
     Safe to run twice: ids come from content and time, and blobs already on
-    the store are skipped. Returns {game: head id}.
+    the store are skipped. Returns {game: head id}; for a game with more than
+    one OS family, the head of the history holding the newest save.
     """
     backups = find_ludusavi_backups(root)
     last = {}           # (game, device) -> manifest
@@ -1520,24 +1788,34 @@ def import_backups(store, root, dry_run=False, progress=None, known=None):
 
     games = {}
     for (game, _device), manifest in last.items():
-        games.setdefault(game, []).append(manifest)
-    for game, tips in games.items():
+        # One merge per OS family: a Mac's save and a Linux one are two
+        # histories, not two sides of a fork.
+        games.setdefault((game, manifest_family(manifest)), []).append(manifest)
+    newest_tip = {}
+    for (game, _family), tips in sorted(games.items()):
         # Newest SAVE wins, as it did under Syncthing, not the newest backup.
         # The first backups on every device were one bulk run minutes apart,
         # so the backup time says nothing about which save is newer.
         tips.sort(key=lambda m: (newest_save_time(m), m["created"]))
-        if len(tips) == 1:
-            heads[game] = tips[0]["id"]
-            continue
         newest = tips[-1]
-        merge = make_manifest(game, newest["device"], list(newest["files"]),
-                              [m["id"] for m in tips], played=newest.get("played"),
-                              created=parse_iso(newest["created"]))
-        merge["merge_only"] = True
-        merge["imported"] = True
-        if not dry_run:
-            commit(store, merge, "")
-        heads[game] = merge["id"]
+        if len(tips) == 1:
+            head = newest["id"]
+        else:
+            # No "os" field on anything imported: the family is read from
+            # the paths, and the ids stay what an earlier import made them.
+            merge = make_manifest(game, newest["device"], list(newest["files"]),
+                                  [m["id"] for m in tips], played=newest.get("played"),
+                                  created=parse_iso(newest["created"]))
+            merge["merge_only"] = True
+            merge["imported"] = True
+            if not dry_run:
+                commit(store, merge, "")
+            head = merge["id"]
+        rank = (newest_save_time(newest), newest["created"])
+        if game not in newest_tip or rank > newest_tip[game]:
+            # With more than one OS, the head of the newest save's history.
+            newest_tip[game] = rank
+            heads[game] = head
     return heads
 
 
@@ -1677,7 +1955,11 @@ def clean(store, now=None, dry_run=False, log=None):
                     pass
         manifests = {sid: json.loads(store.get(key)) for sid, key in snaps.items()}
         view = GameView(game_dir, manifests, {})
-        keep = set(view.heads)
+        # Every OS family's current save is kept. A Mac snapshot naming a
+        # Linux one as its parent does not make the Linux one old.
+        keep = set()
+        for _family, part in view_families(view):
+            keep.update(part.heads)
         by_device = {}
         for sid in manifests:
             by_device.setdefault(snap_device(sid), []).append(sid)

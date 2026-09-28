@@ -299,19 +299,23 @@ class Library(object):
     def _plan(self, appids, wanted):
         """One plan for both switches. `wanted(row)` -> (sync, borderless, tree).
 
-        The frozen Windows exe carries the engine, so its wraps name the exe
-        with --pick in place of python and savepick.py. Either form written
+        The frozen Windows exe and Mac app carry the engine, so their wraps
+        name the program with --pick in place of python and savepick.py. Either form written
         earlier is recognised, and one that is not this install's own is
         wrapped again in the current form.
         """
+        kind = steamdir.install_kind(self.root) if self.root else None
         if paths.engine_in_exe():
             python = paths.launch_program()
             engine = wrap.PICK
             runs_with = str(python)
         else:
-            python = paths.python_for_launch()
+            python = paths.python_for_steam(kind)
             engine = paths.engine_path()
             runs_with = str(engine)
+        # A snap Steam game only starts when the interpreter exists inside
+        # the snap too, so there a wrap naming any other python is redone.
+        check_python = kind == steamdir.SNAP and python == paths.SNAP_PYTHON
         steam_changes = {}
         shortcut_changes = []
         picked = set(int(appid) for appid in appids)
@@ -328,6 +332,10 @@ class Library(object):
                        and wrap.engine_of(row.launch_options,
                                           entry.exe if entry else None)
                        == runs_with
+                       and (not check_python
+                            or wrap.python_of(row.launch_options,
+                                              entry.exe if entry else None)
+                            == str(python))
                        and row.syncing == sync and row.borderless == borderless
                        and row.tree == row_tree)
             if enable and already:

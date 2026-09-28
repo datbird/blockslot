@@ -13,7 +13,38 @@ checks whether that backup is older than the local save. On 2026-09-03 that roll
 Dark Souls II save back by 14 hours on DESKTOP, because the Steam Deck's newest backup
 was from 09-02 1:28 AM while the live save was from 09-02 3:36 PM.
 
-## How the whole thing fits together
+## Two ways to move saves
+
+**The store, the current path.** When `savepick.json` has a `store` section,
+savepick asks nothing of Syncthing. It talks to the daemon, `slotd.py`, over
+127.0.0.1. The daemon owns the store (the BlockSlot server's S3 store, an SSH
+server or a folder) and a queue on disk, and `slotstore.py` is the store's
+code, shared with the server. Before a launch savepick hashes the live save
+and asks the daemon to decide: launch, restore, wait (another device is still
+uploading), or ask (two devices both played). After the game exits it backs
+the save up with ludusavi and hands the backup to the daemon, which commits it
+as a snapshot. Offline, the snapshot waits in the queue. The daemon runs as a
+Windows service, a systemd user unit on Linux, a LaunchAgent on macOS, or
+inside the Decky plugin on the Deck. When none is running, savepick starts
+one.
+
+**Each OS keeps its own history.** A snapshot records the OS of the game build
+that made it: `"os": "windows" | "linux" | "mac"`. Proton on the Deck is
+windows, because the save sits in the Wine prefix and ludusavi translates it
+to and from Windows paths. A device restores, waits for and is offered only
+its own OS's snapshots, and a newer save from another OS is ignored. savepick
+works the OS out at launch: a Proton or Wine launcher in the command, or live
+saves inside a `drive_c`, means windows, and otherwise it is the host's OS.
+Snapshots from before the field have their OS read from the paths ludusavi
+recorded. Emulator library games carry no OS and every device shares them.
+
+**Syncthing, the older path.** Everything below about Syncthing, the hub and
+peer directories is how savepick works when there is no `store` section. It
+still works that way, and the rules that are not about transport (the save-tag
+filter, the one promise, the vault, the fail-safe rule, the dialogs) hold on
+both paths.
+
+## How the whole thing fits together, with Syncthing
 
 Three parts, one job each. There is no SSH anywhere in the running system. Each
 machine only ever reads its own local disk.
@@ -366,6 +397,25 @@ now means the server holds it, not that some other console does. If the hub cann
 reached, a warning appears telling you the save is safe here but the server does not
 have it, and not to play the game on another device until it does.
 
+## macOS preferences saves
+
+A Unity game on macOS (Getting Over It) saves into
+`~/Library/Preferences/<domain>.plist`, a file cfprefsd owns and caches. ludusavi only
+copies files, so savepick hands those domains to cfprefsd with Apple's `defaults` tool
+around each copy:
+
+- Before a backup, and before the live save is hashed or dated, `defaults export
+  <domain> -` is compared with the file. If they differ, what cfprefsd holds is written
+  over the file. A file already in step is never touched.
+- After a restore, `defaults delete <domain>` then `defaults import <domain> <copy>`.
+  Import alone merges into the domain (checked on macOS 26.6), so a key the restored
+  save lacks would survive. If cfprefsd does not end up holding the restored values,
+  the restore counts as not landed and the game starts with the usual warning.
+  cfprefsd rewriting the file stamps it with now, so the backup's mtime that
+  ludusavi restored is put back afterwards.
+
+Nothing here runs off macOS.
+
 ## The vault: the last 10 live saves
 
 ludusavi's own retention keeps the last 10 **backups** per game per machine
@@ -378,9 +428,12 @@ the one case retention cannot: progress that no backup ever captured, after a
 crash or a failed exit backup.
 
 ```
-~/.local/share/savepick/vault/<game>/<UTC stamp>/     Linux and the Deck
+~/.local/share/savepick/vault/<game>/<UTC stamp>/     Linux, the Deck and macOS
 %LOCALAPPDATA%\savepick\vault\<game>\<UTC stamp>\    Windows
 ```
+
+Beside snap Steam the vault, the settings, the log and the daemon's queue are
+under the real home (`SNAP_REAL_HOME`), not the snap's.
 
 The vault sits outside the synced folder, so Syncthing never sees it and it never
 reaches another device. Copies use `copy2`, which preserves mtime, because
@@ -456,10 +509,23 @@ Steam Deck, at `/home/deck/.local/bin/savepick.py`:
 
 `pythonw.exe` on Windows avoids a console window for the whole play session.
 
+The BlockSlot window writes these for you. The built Windows exe and the Mac
+app carry the engine and name themselves instead of python:
+
+```
+"C:\path\to\Blockslot.exe" --pick -- %command%
+/Applications/Blockslot.app/Contents/MacOS/Blockslot --pick -- %command%
+```
+
+A Linux desktop uses the python form, `/usr/bin/python3` included, which is
+the one python that exists both inside and outside snap Steam.
+
 ### Optional config
 
-`~/.config/savepick.json` on Linux, `%APPDATA%\savepick.json` on Windows. Without it
-savepick still works, it just does not wait for the sync.
+`~/.config/savepick.json` on Linux and macOS, `%APPDATA%\savepick.json` on Windows.
+Without it savepick still works, it just does not wait for the sync. The block below is
+the Syncthing path. A `store` section, written by pairing in the BlockSlot window, takes
+its place on the store path.
 
 ```json
 {
@@ -499,19 +565,66 @@ host's own `/usr/bin/zenity` with **Steam's environment left completely alone**.
 - zenity's list widget renders as one squashed unreadable line under gamescope. The
   plain question box is fine.
 
+On macOS there is no zenity or kdialog. The conflict question, the warnings and the
+spinner are `osascript` display dialogs. The spinner's Cancel button is the only thing
+that cancels it: only error -128 counts, and a dialog that could not be shown is shown
+again. `caffeinate -i` keeps the Mac awake while a save uploads.
+
+## Steam Remote Play
+
+A streamed game runs on the host, and the host's Steam starts it with the host's own
+launch option, so the wrap runs there exactly as for a local launch. Steam marks such a
+launch with `SteamStreaming=1` and `SteamStreamingMaximumResolution=WxH` in the game's
+environment, and savepick reads that:
+
+- **Nothing is asked.** `ask_user` returns None (nobody answered), which is never a
+  restore. In store mode the fork is left open rather than closed as "kept this
+  device", so the next launch in front of a screen still asks.
+- **Nothing is shown.** `show_warning` writes the warning to the log only. Every dialog
+  times out anyway, but a minute of an invisible dialog is a minute of black screen on
+  the client.
+- **The exit backup still waits for the game.** Ending a stream does not end the game;
+  quitting it does, and the backup runs then, as it would locally.
+
+If the game is already running on the host, a client's Play button becomes "Stream
+from" that host and the stream joins the running game: no launch, so no restore and no
+new log line. That is how a stream on 2026-09-28 looked as if it had skipped the wrap.
+The game it joined was one savepick had lost track of (next paragraph).
+
+**A stop must reach the game, not just the launcher.** On Linux Steam's command is a
+chain: steam-launch-wrapper, reaper, pressure-vessel, then the game. A SIGTERM sent to
+savepick alone was passed to steam-launch-wrapper, which died of it without passing it
+on. The log said "the game exited with -15", the exit backup ran, and the game played
+on under Steam for three more minutes. savepick now records the game's whole process
+tree when a stop signal arrives. Whatever outlives the launcher gets a few seconds to
+end on its own, then the same signal, then a kill at the usual 30 second deadline, and
+only then does the exit backup run.
+
 ## Logging
 
-`%TEMP%\savepick.log` on Windows, `/tmp/savepick.log` on Linux. One line per launch with
+`%TEMP%\savepick.log` on Windows, `~/.local/state/blockslot/savepick.log` on Linux, the
+Deck and macOS. Not `/tmp`: SteamOS clears it on every restart. One line per launch with
 the game, both timestamps and the decision, plus the gamepad and dialog outcomes.
+
+The first line of every launch is `started (pid N) for steam app ID`, written before
+anything that can fail, with `Remote Play: streaming to a client` added for a stream.
+A Steam launch with no such line never reached savepick.
 
 ## Tests
 
 ```
 python3 -m unittest test_savepick -v
+python3 -m unittest test_slotstore test_slotd test_saveunits
 ```
 
-206 tests over the decision logic, the mtime scan, the save-tag filter, the Syncthing
-wait, picking the newest backup across every peer directory, the restore and its check,
+478 tests in `test_savepick`, 92 in `test_slotstore`, 65 in `test_slotd` and 16 in
+`test_saveunits` (2026-09-28). Some skip themselves where what they check is not there:
+the real AppleScripts, launchctl and cfprefsd off macOS, DPAPI off Windows, systemd off
+Linux, and a real S3 or SSH store unless `BLOCKSLOT_TEST_S3` or `BLOCKSLOT_TEST_SSH`
+names one.
+
+The first suite covers the decision logic, the mtime scan, the save-tag filter, the
+store path and each OS's history, the Syncthing wait, picking the newest backup across every peer directory, the restore and its check,
 the launch path, the vault, joystick and XInput parsing, the config loader, the dialog
 wording and every fail-safe path. They need no ludusavi install, no Syncthing and no
 GUI. Several are regression tests for bugs that actually shipped, including a kdialog
@@ -566,3 +679,11 @@ it. Every ludusavi call closes stdin, which on its own was a 120 second hang
 before every launch on the Windows PC. Proven on both machines: no SteamAppId,
 an unknown SteamAppId, an unconfirmed sync and a full end to end run all start
 the game.
+
+2026-09-28: macOS and a Linux desktop joined. On a Mac (macOS 26.6) the engine runs from
+inside `Blockslot.app`, its dialogs are osascript, and preferences-plist saves go through
+cfprefsd. On an Ubuntu 26.04 laptop with snap Steam it runs under the snap's own python
+with its files in the real home. Each machine ran Getting Over It through the launch
+option, and each exit backup reached the store. The same day each OS got its own save
+history, after a Linux snapshot of that game became the newest and a Mac tried to restore
+it to a Linux path.

@@ -6,12 +6,11 @@ find the test on the left and the settings on the right in both.
 
 Nothing slow runs on the Tk thread. A store test can wait 30 seconds on a
 server that does not answer, and an import can take minutes, so both run in a
-thread and hand their answer back with app.after, as the games screen does.
+thread and hand their answer back with app.post, as the games screen does.
 """
 
 import socket
 import threading
-import time
 import tkinter as tk
 
 from ..core import settings as settings_mod
@@ -74,7 +73,8 @@ class StoreScreen(app_mod.Screen):
         self.daemon_line = tk.Label(left, text="Asking the daemon ...",
                                     bg=theme.BG, fg=theme.TEXT_DIM, anchor="w",
                                     justify="left", font=self.metrics.font("small"),
-                                    wraplength=int(self.metrics.base * 30))
+                                    wraplength=int(self.metrics.px(
+                                        self.metrics.base * 30)))
         self.daemon_line.grid(row=1, column=0, sticky="ew", pady=(gap, 0))
 
         form = tk.Frame(self, bg=theme.BG)
@@ -351,11 +351,9 @@ class StoreScreen(app_mod.Screen):
         self.refresh_daemon()
 
     def _later(self, callback, *args):
-        """Hand a worker's answer to the Tk thread. The window may be gone."""
-        try:
-            self.app.after(0, callback, *args)
-        except (RuntimeError, tk.TclError):
-            pass
+        """Hand a worker's answer to the Tk thread (App.post: never Tk from
+        a worker). If the window is gone by then, nobody collects it."""
+        self.app.post(callback, *args)
 
     def refresh_daemon(self):
         threading.Thread(target=self._daemon_worker, daemon=True).start()
@@ -390,16 +388,22 @@ class StoreScreen(app_mod.Screen):
     def test(self):
         self.status.configure(text="Testing ...")
         self.save_button.set_enabled(False)
-        threading.Thread(target=self._test_worker, daemon=True).start()
+        # Numbered, so a slow answer about the settings before a save cannot
+        # land after the answer about the settings that were saved.
+        self._test_number = getattr(self, "_test_number", 0) + 1
+        threading.Thread(target=self._test_worker, args=(self._test_number,),
+                         daemon=True).start()
 
-    def _test_worker(self):
+    def _test_worker(self, number=None):
         try:
             steps = storecheck.test_store(self.settings)
         except Exception as exc:
             steps = [("Test", False, str(exc))]
-        self._later(self._show_checks, steps)
+        self._later(self._show_checks, steps, number)
 
-    def _show_checks(self, steps):
+    def _show_checks(self, steps, number=None):
+        if number is not None and number != getattr(self, "_test_number", number):
+            return
         rows = [Check(label, ok, detail) for label, ok, detail in steps]
         self.checks.set_rows(rows, keep_cursor=False)
         self.status.configure(text="")
@@ -457,18 +461,19 @@ class StoreScreen(app_mod.Screen):
     def _import_worker(self, panel, root):
         try:
             backups, devices, games = storecheck.count_backups(root)
-            if not backups:
-                panel.say("No ludusavi backups found in %s." % root)
-            else:
+            if backups:
                 panel.say("Found %d backups of %d games from %d devices."
                           % (backups, games, devices))
                 heads = storecheck.import_folder(self.settings, root, say=panel.say)
-                panel.say("Done. %d game%s on the store."
-                          % (len(heads), "" if len(heads) == 1 else "s"))
+                panel.finish("Done. %d game%s on the store."
+                             % (len(heads), "" if len(heads) == 1 else "s"),
+                             True, then=self.refresh_daemon)
+                return
+            panel.finish("No ludusavi backups found in %s." % root, False,
+                         then=self.refresh_daemon)
         except OSError as exc:
-            panel.say("Could not read the folder: %s" % exc)
+            panel.finish("Could not read the folder: %s" % exc, False,
+                         then=self.refresh_daemon)
         except Exception as exc:
-            panel.say("Stopped: %s" % storecheck.explain(exc))
-        time.sleep(2.0)
-        panel.close()
-        self._later(self.refresh_daemon)
+            panel.finish("Stopped: %s" % storecheck.explain(exc), False,
+                         then=self.refresh_daemon)

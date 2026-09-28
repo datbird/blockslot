@@ -129,8 +129,13 @@ class Pump(object):
                 widget.event_generate("<%s>" % key)
             except Exception:
                 pass
+        # This is the pad's thread, so no Tk here: App.post queues it for the
+        # Tk thread. A window without post (a test's) gets after().
         try:
-            window.after(0, fire)
+            if hasattr(window, "post"):
+                window.post(fire)
+            else:
+                window.after(0, fire)
         except Exception:
             self.stop.set()
 

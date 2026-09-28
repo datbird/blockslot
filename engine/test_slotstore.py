@@ -800,3 +800,307 @@ class RealSSH(Temp):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+# ------------------------------------------------------------------ operating systems
+#
+# Each OS family keeps its own history of a game. The mapping.yaml texts
+# below are the real ones from the store on 2026-09-28: Getting Over It on
+# a Mac and on a Linux desktop, and Dark Souls II under Proton on the Deck
+# and natively on Windows.
+
+MAPPING_MAC = '''---
+name: Getting Over It with Bennett Foddy
+drives:
+  drive-0: ""
+backups:
+  - name: "."
+    when: "2026-09-28T15:06:39.724137Z"
+    os: mac
+    files:
+      /Users/admin/Library/Preferences/net.Foddy.GettingOverIt.plist:
+        hash: b29b1fcddcdbdc4f3514bf0312a3e7c74decd53c
+        size: 1338
+    registry:
+      hash: ~
+    children: []
+'''
+
+MAPPING_LINUX = '''---
+name: Getting Over It with Bennett Foddy
+drives:
+  drive-0: ""
+backups:
+  - name: "."
+    when: "2026-09-28T15:04:02.603084681Z"
+    os: linux
+    files:
+      /home/player/snap/steam/common/.config/unity3d/Bennett Foddy/Getting Over It/prefs:
+        hash: aaa8ae957adec99a31ded748b684cc5ac4b29750
+        size: 2668
+    registry:
+      hash: ~
+    children: []
+'''
+
+DECK_PREFIX = "/home/deck/.local/share/Steam/steamapps/compatdata/335300/pfx"
+DECK_SAVE = DECK_PREFIX + ("/drive_c/users/steamuser/AppData/Roaming/DarkSoulsII/"
+                           "011000010101e6e8/DS2SOFS0000.sl2")
+
+MAPPING_PROTON = '''---
+name: "Dark Souls II: Scholar of the First Sin"
+drives:
+  drive-0: ""
+backups:
+  - name: backup-20260925T143415Z
+    when: "2026-09-25T14:34:15.100340418Z"
+    os: linux
+    semantics:
+      directories:
+        %s:
+          kind: wine
+    files:
+      %s:
+        hash: 786748da771273173dff9fce86c186c4e04c7208
+        size: 8251680
+    registry:
+      hash: ~
+    children: []
+''' % (DECK_PREFIX, DECK_SAVE)
+
+MAPPING_WINDOWS = '''---
+name: "Dark Souls II: Scholar of the First Sin"
+drives:
+  drive-C: "C:"
+backups:
+  - name: backup-20260926T063457Z
+    when: "2026-09-26T06:34:57.633569600Z"
+    os: windows
+    files:
+      "C:/Users/player/AppData/Roaming/DarkSoulsII/011000010101e6e8/DS2SOFS0000.sl2":
+        hash: f3b9d9e3946d0a34ca8c09f19698886d8a9ef513
+        size: 8251680
+    registry:
+      hash: ~
+    children: []
+'''
+
+GOI = "Getting Over It with Bennett Foddy"
+
+# (mapping, path of the save inside the backup folder) per kind of device.
+OS_BACKUPS = {
+    "mac": (MAPPING_MAC, "drive-0/Users/admin/Library/Preferences/net.Foddy.GettingOverIt.plist"),
+    "linux": (MAPPING_LINUX, "drive-0/home/player/snap/steam/common/.config/unity3d/"
+                             "Bennett Foddy/Getting Over It/prefs"),
+    "proton": (MAPPING_PROTON, "backup-20260925T143415Z/drive-0" + DECK_SAVE),
+    "windows": (MAPPING_WINDOWS, "backup-20260926T063457Z/drive-C/Users/player/AppData/"
+                                 "Roaming/DarkSoulsII/011000010101e6e8/DS2SOFS0000.sl2"),
+    # A native Linux build on the Deck: another home, the same family.
+    "deck-native": (MAPPING_LINUX.replace("/home/player/snap/steam/common", "/home/deck"),
+                    "drive-0/home/deck/.config/unity3d/Bennett Foddy/Getting Over It/prefs"),
+}
+
+
+def os_backup(root, kind, save):
+    """A ludusavi backup folder as `kind` of device makes it, with its real mapping."""
+    mapping, rel = OS_BACKUPS[kind]
+    game = os.path.join(root, "game")
+    write(os.path.join(game, "mapping.yaml"), mapping)
+    write(os.path.join(game, *rel.split("/")), save)
+    return root
+
+
+class OperatingSystems(Temp):
+    def test_ludusavi_says_which_os_a_backup_is_for(self):
+        self.assertEqual(ss.mapping_family(MAPPING_MAC), ss.MAC)
+        self.assertEqual(ss.mapping_family(MAPPING_LINUX), ss.LINUX)
+        self.assertEqual(ss.mapping_family(MAPPING_WINDOWS), ss.WINDOWS)
+        self.assertIsNone(ss.mapping_family("name: DS2\nbackups: [b]\n"))
+
+    def test_a_proton_save_on_the_deck_is_a_windows_save(self):
+        # ludusavi says "linux", but every file is in a Wine prefix: the
+        # Windows build ran, and ludusavi carries it to and from Windows.
+        self.assertEqual(ss.mapping_family(MAPPING_PROTON), ss.WINDOWS)
+        without = MAPPING_PROTON.replace("    semantics:\n      directories:\n        %s:\n"
+                                         "          kind: wine\n" % DECK_PREFIX, "")
+        self.assertNotIn("semantics", without)
+        # A prefix ludusavi was not told about still has its drive_c.
+        self.assertEqual(ss.mapping_family(without), ss.WINDOWS)
+
+    def test_a_linux_backup_with_one_file_outside_the_prefix_is_linux(self):
+        mixed = MAPPING_PROTON.replace(
+            "    registry:", "      /home/deck/.config/native/prefs:\n        hash: x\n"
+                              "        size: 1\n    registry:")
+        self.assertEqual(ss.mapping_family(mixed), ss.LINUX)
+
+    def test_live_paths(self):
+        self.assertEqual(ss.paths_family([DECK_SAVE], platform="linux"), ss.WINDOWS)
+        self.assertEqual(ss.paths_family(["/home/t/.config/x/prefs"], platform="linux"),
+                         ss.LINUX)
+        self.assertEqual(ss.paths_family(["/Users/a/Library/Preferences/x.plist"],
+                                         platform="darwin"), ss.MAC)
+        self.assertEqual(ss.paths_family(["C:\\Users\\a\\x.sav"], platform="win32"),
+                         ss.WINDOWS)
+        self.assertIsNone(ss.paths_family([], platform="linux"))
+
+    def test_staging_records_the_os(self):
+        for kind, family in (("mac", ss.MAC), ("linux", ss.LINUX), ("proton", ss.WINDOWS),
+                             ("windows", ss.WINDOWS), ("deck-native", ss.LINUX)):
+            source = os_backup(tempfile.mkdtemp(dir=self.dir), kind, b"s")
+            manifest = self.state(kind).stage(GOI, kind, source)
+            self.assertEqual(manifest["os"], family, kind)
+
+    def test_the_caller_knows_best(self):
+        # The picker saw Proton in the launch command: a Windows build, even
+        # for a save in the install folder that has no drive_c.
+        source = os_backup(tempfile.mkdtemp(dir=self.dir), "deck-native", b"s")
+        manifest = self.state("deck").stage(GOI, "deck", source, os_family=ss.WINDOWS)
+        self.assertEqual(manifest["os"], ss.WINDOWS)
+
+    def test_a_library_game_belongs_to_every_os(self):
+        source = tempfile.mkdtemp(dir=self.dir)
+        write(os.path.join(source, "snes", "Metroid.srm"), b"sram")
+        manifest = self.state("deck").stage("lib-x--y", "deck", source, mode="library",
+                                            os_family=ss.LINUX)
+        self.assertNotIn("os", manifest)
+        self.assertEqual(ss.manifest_family(manifest), ss.ANY)
+
+    def test_legacy_snapshots_read_their_os_from_their_paths(self):
+        def legacy(kind):
+            _mapping, rel = OS_BACKUPS[kind]
+            return {"mode": "game", "files": [
+                {"path": "game/" + rel, "sha256": "a" * 64, "size": 1},
+                {"path": "game/mapping.yaml", "sha256": "b" * 64, "size": 1}]}
+        self.assertEqual(ss.manifest_family(legacy("windows")), ss.WINDOWS)
+        self.assertEqual(ss.manifest_family(legacy("proton")), ss.WINDOWS)
+        self.assertEqual(ss.manifest_family(legacy("linux")), ss.LINUX)
+        self.assertEqual(ss.manifest_family(legacy("deck-native")), ss.LINUX)
+        self.assertEqual(ss.manifest_family(legacy("mac")), ss.MAC)
+        self.assertEqual(ss.manifest_family({"mode": "library", "files": []}), ss.ANY)
+        self.assertEqual(ss.manifest_family({"mode": "game", "files": [
+            {"path": "odd/place/save", "sha256": "a" * 64, "size": 1}]}), ss.ANY)
+
+    def test_legacy_ids_do_not_change(self):
+        # No os_family, no "os" field: an import run again makes the same ids.
+        one = ss.make_manifest(GAME, "deck", [], [], created=ss.parse_iso("2026-09-01T00:00:00Z"))
+        self.assertNotIn("os", one)
+        two = ss.make_manifest(GAME, "deck", [], [], created=ss.parse_iso("2026-09-01T00:00:00Z"),
+                               os_family=ss.LINUX)
+        self.assertNotEqual(one["id"], two["id"])
+
+    def commit(self, device, kind, save, parents=(), when=None, os_field=True):
+        source = os_backup(tempfile.mkdtemp(dir=self.dir), kind, save)
+        files = ss.scan_dir(source)
+        family = ss.backup_family(source) if os_field else None
+        manifest = ss.make_manifest(GOI, device, files, list(parents),
+                                    played={"end": when} if when else None,
+                                    created=ss.parse_iso(when) if when else None,
+                                    os_family=family)
+        ss.commit(self.store, manifest, source)
+        return manifest
+
+    def test_a_mac_ignores_a_newer_linux_save(self):
+        mac = self.commit("imac", "mac", b"mac", when="2026-09-28T15:00:00Z")
+        self.commit("ubuntu", "linux", b"linux", when="2026-09-28T16:00:00Z")
+        view = ss.read_game(self.store, GOI)
+        local = ss.save_hashes(mac)
+        self.assertEqual(ss.decide(view, mac["id"], local, "imac", family=ss.MAC),
+                         (ss.LAUNCH, None))
+        # Before families, this was the restore that failed on 2026-09-28.
+        self.assertEqual(ss.decide(view, mac["id"], local, "imac")[0], ss.ASK)
+
+    def test_linux_ignores_a_newer_mac_save(self):
+        linux = self.commit("ubuntu", "linux", b"linux", when="2026-09-28T15:00:00Z")
+        self.commit("imac", "mac", b"mac", when="2026-09-28T16:00:00Z")
+        view = ss.read_game(self.store, GOI)
+        self.assertEqual(ss.decide(view, linux["id"], ss.save_hashes(linux), "ubuntu",
+                                   family=ss.LINUX), (ss.LAUNCH, None))
+        # A new Linux device restores the Linux save, not the newer Mac one.
+        self.assertEqual(ss.decide(view, None, set(), "laptop", family=ss.LINUX),
+                         (ss.RESTORE, linux["id"]))
+
+    def test_the_deck_and_a_linux_desktop_share(self):
+        deck = self.commit("deck", "deck-native", b"deck", when="2026-09-28T15:00:00Z")
+        desk = self.commit("ubuntu", "linux", b"desk", parents=[deck["id"]],
+                           when="2026-09-28T16:00:00Z")
+        view = ss.read_game(self.store, GOI)
+        self.assertEqual(ss.decide(view, deck["id"], ss.save_hashes(deck), "deck",
+                                   family=ss.LINUX), (ss.RESTORE, desk["id"]))
+
+    def test_proton_on_the_deck_and_windows_share(self):
+        deck = self.commit("deck", "proton", b"deck", when="2026-09-25T14:34:15Z")
+        pc = self.commit("pc1", "windows", b"pc", parents=[deck["id"]],
+                         when="2026-09-26T06:34:57Z")
+        view = ss.read_game(self.store, GOI)
+        self.assertEqual(ss.decide(view, deck["id"], ss.save_hashes(deck), "deck",
+                                   family=ss.WINDOWS), (ss.RESTORE, pc["id"]))
+        back = self.commit("deck", "proton", b"deck2", parents=[pc["id"]],
+                           when="2026-09-27T10:00:00Z")
+        view = ss.read_game(self.store, GOI)
+        self.assertEqual(ss.decide(view, pc["id"], ss.save_hashes(pc), "pc1",
+                                   family=ss.WINDOWS), (ss.RESTORE, back["id"]))
+
+    def test_legacy_proton_and_windows_snapshots_still_share(self):
+        # Made before the field: no "os" anywhere, the family from the paths.
+        deck = self.commit("deck", "proton", b"deck", when="2026-09-25T14:34:15Z",
+                           os_field=False)
+        pc = self.commit("pc1", "windows", b"pc", parents=[deck["id"]],
+                         when="2026-09-26T06:34:57Z", os_field=False)
+        self.assertNotIn("os", pc)
+        view = ss.read_game(self.store, GOI)
+        self.assertEqual(ss.decide(view, deck["id"], ss.save_hashes(deck), "deck",
+                                   family=ss.WINDOWS), (ss.RESTORE, pc["id"]))
+        # And a legacy Linux one is not the Mac's.
+        self.commit("ubuntu", "linux", b"l", when="2026-09-27T00:00:00Z", os_field=False)
+        view = ss.read_game(self.store, GOI)
+        self.assertEqual(ss.decide(view, None, set(), "imac", family=ss.MAC),
+                         (ss.LAUNCH, None))
+
+    def test_a_fork_is_only_within_one_os(self):
+        self.commit("ubuntu", "linux", b"l", when="2026-09-28T15:00:00Z")
+        self.commit("imac", "mac", b"m", when="2026-09-28T16:00:00Z")
+        view = ss.read_game(self.store, GOI)
+        self.assertEqual(len(view.heads), 2)
+        self.assertEqual([f for f, _v in ss.view_families(view)], [ss.LINUX, ss.MAC])
+        for _family, part in ss.view_families(view):
+            self.assertEqual(len(part.heads), 1)
+
+    def test_another_os_uploading_is_not_waited_for(self):
+        linux = self.commit("ubuntu", "linux", b"l", when="2026-09-28T15:00:00Z")
+        intent = {"id": "20990101T000000Z_imac_abcdef01", "device": "imac",
+                  "os": ss.MAC}
+        self.store.put(ss.pending_key(GOI, intent["id"]), ss.manifest_bytes(intent))
+        view = ss.read_game(self.store, GOI)
+        local = ss.save_hashes(linux)
+        self.assertEqual(ss.decide(view, linux["id"], local, "ubuntu", family=ss.LINUX),
+                         (ss.LAUNCH, None))
+        self.assertEqual(ss.decide(view, linux["id"], local, "ubuntu", family=ss.MAC)[0],
+                         ss.WAIT)
+
+    def test_a_base_from_another_os_is_not_this_ones(self):
+        # The Mac took the Linux snapshot as its base before families: its
+        # own history must still decide by itself.
+        linux = self.commit("ubuntu", "linux", b"l", when="2026-09-28T15:00:00Z")
+        mac = self.commit("imac", "mac", b"m", parents=[linux["id"]],
+                          when="2026-09-28T16:00:00Z")
+        view = ss.read_game(self.store, GOI)
+        self.assertEqual(ss.decide(view, linux["id"], set(), "laptop", family=ss.MAC),
+                         (ss.RESTORE, mac["id"]))
+        self.assertEqual(ss.device_family(view, "imac"), ss.MAC)
+        self.assertEqual(ss.device_family(view, "ubuntu"), ss.LINUX)
+        self.assertEqual(ss.device_family(view, "laptop", base=mac["id"]), ss.MAC)
+        self.assertIsNone(ss.device_family(view, "laptop"))
+
+    def test_clean_keeps_every_os_head(self):
+        # The Deck played the native build, then switched to Proton. Its
+        # Windows snapshot names the Linux one as its parent, and is its
+        # newest; the Linux one is still Linux's current save and must stay.
+        linux = self.commit("deck", "deck-native", b"l", when="2026-01-01T00:00:00Z")
+        self.commit("deck", "proton", b"w", parents=[linux["id"]], when="2026-01-02T00:00:00Z")
+        saved = ss.KEEP_PER_DEVICE
+        ss.KEEP_PER_DEVICE = 1
+        try:
+            ss.clean(self.store, now=ss.parse_iso("2026-09-28T00:00:00Z"))
+        finally:
+            ss.KEEP_PER_DEVICE = saved
+        self.assertIn(linux["id"], ss.read_game(self.store, GOI).manifests)

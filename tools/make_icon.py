@@ -16,9 +16,16 @@ It writes:
     assets/blockslot-tray.ico  the notification area icon
     assets/blockslot.png       256 px, for the window and the Deck
     assets/blockslot-1024.png  the full-size mark, for stores and docs
+    assets/blockslot.icns      the Mac app's icon, every size Finder asks for
+
+The .icns is written here rather than with Apple's iconutil so that it can be
+made on any machine and committed: the Mac build then needs nothing but
+PyInstaller. It is the plain container, each size a PNG, which is what
+iconutil itself writes.
 """
 
 import io
+import struct
 from pathlib import Path
 
 import cairosvg
@@ -40,6 +47,35 @@ def write_ico(path, images):
                  append_images=images[:-1])
 
 
+# (type, pixels) for each PNG an .icns carries; the @2x types are the same
+# pixels as the next size up, which Finder uses on a Retina screen.
+ICNS_TYPES = (
+    (b"icp4", 16), (b"icp5", 32), (b"ic11", 32), (b"icp6", 64),
+    (b"ic12", 64), (b"ic07", 128), (b"ic13", 256), (b"ic08", 256),
+    (b"ic14", 512), (b"ic09", 512), (b"ic10", 1024),
+)
+
+
+def png_bytes(image):
+    out = io.BytesIO()
+    image.save(out, format="PNG")
+    return out.getvalue()
+
+
+def write_icns(path):
+    """An .icns of PNGs: 'icns', its length, then (type, length, data) each."""
+    cache = {}
+    body = b""
+    for kind, size in ICNS_TYPES:
+        if size not in cache:
+            cache[size] = png_bytes(
+                render("icon-small.svg" if size <= SMALL else "icon.svg", size))
+        data = cache[size]
+        body += kind + struct.pack(">I", len(data) + 8) + data
+    with open(str(path), "wb") as handle:
+        handle.write(b"icns" + struct.pack(">I", len(body) + 8) + body)
+
+
 def main():
     sizes = (16, 20, 24, 32, 40, 48, 64, 128, 256)
     app = [render("icon-small.svg" if s <= SMALL else "icon.svg", s) for s in sizes]
@@ -49,7 +85,9 @@ def main():
     write_ico(ASSETS / "blockslot-tray.ico", tray)
     render("icon.svg", 256).save(str(ASSETS / "blockslot.png"))
     render("icon.svg", 1024).save(str(ASSETS / "blockslot-1024.png"))
-    for name in ("blockslot.ico", "blockslot-tray.ico", "blockslot.png", "blockslot-1024.png"):
+    write_icns(ASSETS / "blockslot.icns")
+    for name in ("blockslot.ico", "blockslot-tray.ico", "blockslot.png",
+                 "blockslot-1024.png", "blockslot.icns"):
         print("wrote", ASSETS / name)
 
 

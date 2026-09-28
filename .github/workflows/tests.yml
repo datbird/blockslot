@@ -12,6 +12,7 @@ on:
     paths:
       - "engine/**"
       - "gui/**"
+      - "server/**"
       - ".github/workflows/tests.yml"
   pull_request:
   workflow_dispatch:
@@ -27,6 +28,23 @@ jobs:
         with:
           python-version: "3.9"
       - run: python engine/test_savepick.py
+      - run: python engine/test_slotstore.py
+      - run: python engine/test_slotd.py
+      - run: python engine/test_saveunits.py
+
+  server:
+    name: Server
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          # The server image is python:3.12-alpine.
+          python-version: "3.12"
+      # The server itself is standard library only. These two only sign the
+      # test tokens its Cloudflare Access check has to verify.
+      - run: pip install --quiet -r server/requirements-test.txt
+      - run: python -m unittest discover -s server/tests
 
   gui:
     name: Window on ${{ matrix.os }} (python ${{ matrix.python }})

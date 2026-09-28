@@ -58,6 +58,57 @@ DIALOG_TIMEOUT_SECONDS = 30
 
 METADATA_NAMES = {"mapping.yaml", "registry.yaml"}
 
+
+def in_snap():
+    """True when snap Steam started us, inside its confinement.
+
+    The Steam snap gives a game HOME=~/snap/steam/common and points
+    XDG_CONFIG_HOME and XDG_DATA_HOME in there as well. snapd keeps the real
+    home in SNAP_REAL_HOME. (Probed on an Ubuntu 26.04 laptop, steam snap rev 271,
+    2026-09-28.)
+    """
+    return bool(os.environ.get("SNAP_NAME") and os.environ.get("SNAP_REAL_HOME"))
+
+
+def real_home():
+    """The home Blockslot's own files live in, also from inside the snap.
+
+    Only Blockslot's files move: savepick.json, the log, the vault, the
+    daemon's queue and ludusavi's binary. ludusavi itself still runs with the
+    snap's HOME, because that is where a game snap Steam started writes its
+    save (~/snap/steam/common/.config/unity3d/... and so on).
+    """
+    if in_snap():
+        return Path(os.environ["SNAP_REAL_HOME"])
+    return Path.home()
+
+
+def xdg_home(variable, default):
+    """An XDG base directory under the real home; the snap's are ignored."""
+    value = os.environ.get(variable)
+    if value and not in_snap():
+        return Path(value)
+    return real_home() / default
+
+
+def handoff_parent():
+    """Where a folder handed to the daemon is made, or None for the default.
+
+    The daemon reads what the picker backed up and writes what it fetched,
+    and it runs outside the snap. Inside it, /tmp is the snap's private one,
+    which the daemon cannot see, so those folders go beside the daemon's
+    queue under the real home instead.
+    """
+    if not in_snap():
+        return None
+    where = xdg_home("XDG_STATE_HOME", ".local/state") / "blockslot" / "handoff"
+    try:
+        where.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        return None
+    return str(where)
+
+
 def _log_path():
     """Where the log lives, the same place the Blockslot window reads it.
 
@@ -67,8 +118,7 @@ def _log_path():
     """
     if sys.platform == "win32":
         return Path(tempfile.gettempdir()) / "savepick.log"
-    base = os.environ.get("XDG_STATE_HOME") or os.path.join(os.path.expanduser("~"), ".local", "state")
-    return Path(base) / "blockslot" / "savepick.log"
+    return xdg_home("XDG_STATE_HOME", ".local/state") / "blockslot" / "savepick.log"
 
 
 LOG_PATH = _log_path()
@@ -102,6 +152,31 @@ def log(message):
 
 def is_windows():
     return os.name == "nt"
+
+
+def is_mac():
+    return sys.platform == "darwin"
+
+
+# ---------------------------------------------------------------- Remote Play
+#
+# With Steam Remote Play the game runs on the HOST and only its picture goes
+# to the client. The host starts it through its own Steam with its own launch
+# options, so savepick wraps a streamed launch exactly like a local one, and
+# Steam marks it with SteamStreaming=1 and SteamStreamingMaximumResolution in
+# the game's environment.
+#
+# Nobody sits at the host. A dialog there is invisible to the player, and
+# every one of ours waits up to a minute before the game starts. So in a
+# streamed launch nothing is asked and nothing is shown: every question takes
+# the answer that changes nothing, and every warning goes to the log only.
+REMOTE_PLAY_VARS = ("SteamStreaming", "SteamStreamingMaximumResolution")
+
+
+def remote_play(env=None):
+    """True when Steam started this launch for a Remote Play client."""
+    env = os.environ if env is None else env
+    return str(env.get("SteamStreaming") or "").strip() not in ("", "0")
 
 
 # Windows gives every console program its own black window, and pythonw only
@@ -160,7 +235,7 @@ def ludusavi_binary():
         return override
     if is_windows():
         return str(Path.home() / ".local" / "bin" / "ludusavi.exe")
-    return str(Path.home() / ".local" / "bin" / "ludusavi")
+    return str(real_home() / ".local" / "bin" / "ludusavi")
 
 
 def run_json(args, timeout=120):
@@ -250,7 +325,68 @@ def pick_newest_backup(backups):
     return sorted(backups, key=key)[-1]
 
 
+# How long the one-off first fetch of ludusavi's manifest may take.
+MANIFEST_FETCH_SECONDS = 90
+
+
+def ludusavi_config_dir():
+    """Where ludusavi keeps its config and its manifest on this device.
+
+    Its own rule: beside the binary when it runs portable, otherwise the
+    platform's config folder, which on Linux honours XDG_CONFIG_HOME (the
+    Steam snap sets that to its own home).
+    """
+    binary = Path(ludusavi_binary())
+    if (binary.parent / "ludusavi.portable").is_file():
+        return binary.parent
+    if is_windows():
+        return Path(os.environ.get("APPDATA") or str(Path.home())) / "ludusavi"
+    if sys.platform == "darwin":
+        return Path.home() / "Library" / "Application Support" / "ludusavi"
+    base = os.environ.get("XDG_CONFIG_HOME") or str(Path.home() / ".config")
+    return Path(base) / "ludusavi"
+
+
+def ensure_manifest(run=None):
+    """Fetch ludusavi's manifest once, on a device that has never had one.
+
+    Every call here passes --no-manifest-update, so a fresh install, a new
+    desktop or a Steam snap with its own home, never gets the manifest at
+    all, and without it ludusavi knows no game: every launch went ahead with
+    no restore and no backup, and only the log said why. The first launch
+    pays for one download; after that the file is there and this does nothing.
+    """
+    manifest = ludusavi_config_dir() / "manifest.yaml"
+    if manifest.is_file():
+        return True
+    binary = ludusavi_binary()
+    # No ludusavi at all is a different problem, and run_json reports it.
+    # Flashing a spinner for a fetch that cannot start would only hide it.
+    if not (Path(binary).is_file() or shutil.which(binary)):
+        return False
+    log("ludusavi has no manifest at %s; fetching it once" % manifest)
+    cmd = [binary, "manifest", "update", "--force"]
+    # A minute with nothing on screen would read as a hang.
+    spinner = Spinner(APP_TITLE, "Getting ludusavi's list of games ...") \
+        if run is None else None
+    try:
+        done = (run or subprocess.run)(
+            cmd, capture_output=True, text=True, timeout=MANIFEST_FETCH_SECONDS,
+            stdin=subprocess.DEVNULL, **no_window())
+    except (OSError, subprocess.SubprocessError) as exc:
+        log("ludusavi manifest fetch failed: %s" % exc)
+        return False
+    finally:
+        if spinner is not None:
+            spinner.close()
+    if done.returncode != 0:
+        log("ludusavi manifest fetch exit %s: %s"
+            % (done.returncode, (done.stderr or "")[:200]))
+    return manifest.is_file()
+
+
 def game_name_for_appid(appid):
+    ensure_manifest()
     # --no-manifest-update matters here: a game launch must never block on a
     # network fetch. `find` updates the manifest by default.
     data = run_json(["--no-manifest-update", "find", "--api", "--steam-id", str(appid)])
@@ -1015,12 +1151,143 @@ def read_kdialog(returncode, stderr):
     return None
 
 
+# ---------------------------------------------------------------- macOS dialogs
+#
+# A Mac has neither zenity nor kdialog, and savepick has never used tk (a
+# python from the developer tools may have no working tk at all, and tk
+# started without a window server hangs instead of failing). Every Mac has
+# osascript, whose `display dialog` is the system's own alert, so that is
+# what the picker shows there. Each script takes its words as arguments
+# (`on run argv`), so nothing a game is called can break out of a string.
+# Run with no arguments, a script only compiles and answers READY, which is
+# how the tests prove it parses without putting a window on screen.
+
+OSASCRIPT = "/usr/bin/osascript"
+
+MAC_ASK = (
+    'on run argv',
+    'if (count of argv) is 0 then return "READY"',
+    'set keepLabel to item 3 of argv',
+    'set restLabel to item 4 of argv',
+    'activate',
+    'try',
+    'set answer to display dialog (item 1 of argv) with title (item 2 of argv) '
+    'buttons {restLabel, keepLabel} default button keepLabel '
+    'giving up after ((item 5 of argv) as integer) with icon caution',
+    'on error number -128',
+    'return "KEEP"',
+    'end try',
+    'if gave up of answer then return "TIMEOUT"',
+    'if button returned of answer is restLabel then return "RESTORE"',
+    'return "KEEP"',
+    'end run',
+)
+
+MAC_WARN = (
+    'on run argv',
+    'if (count of argv) is 0 then return "READY"',
+    'activate',
+    'display dialog (item 1 of argv) with title (item 2 of argv) '
+    'buttons {"OK"} default button "OK" '
+    'giving up after ((item 3 of argv) as integer) with icon caution',
+    'return "OK"',
+    'end run',
+)
+
+# The spinner is a dialog with one button, closed by killing osascript when
+# the work is done. `display dialog` cannot change its text once shown, so a
+# Mac sees the first line of a wait and not its progress; the log has that.
+#
+# Only the button ends it cleanly (exit 0), which is what Spinner.cancelled()
+# reads as Cancel. So: no default button, or a stray Return would cancel the
+# wait; the hour's give-up shows it again instead of ending it; and only
+# error -128 (the Cancel button, or Escape) is caught. Any other error, such
+# as no user interaction allowed, exits non-zero and cancels nothing.
+MAC_SPINNER = (
+    'on run argv',
+    'if (count of argv) is 0 then return "READY"',
+    'activate',
+    'repeat',
+    'try',
+    'set shown to display dialog (item 1 of argv) with title (item 2 of argv) '
+    'buttons {item 3 of argv} giving up after 3600',
+    'if not (gave up of shown) then return "CLOSED"',
+    'on error number -128',
+    'return "CLOSED"',
+    'end try',
+    'end repeat',
+    'end run',
+)
+
+
+def osascript_command(script, args=()):
+    """osascript with a script given line by line, then its arguments."""
+    cmd = [OSASCRIPT]
+    for line in script:
+        cmd += ["-e", line]
+    return cmd + [str(arg) for arg in args]
+
+
+def run_osascript(script, args, timeout, run=None):
+    """(exit code, last line of stdout, stderr), or None when it did not run."""
+    try:
+        proc = (run or subprocess.run)(
+            osascript_command(script, args), capture_output=True,
+            text=True, timeout=timeout, stdin=subprocess.DEVNULL)
+    except (OSError, subprocess.SubprocessError) as exc:
+        log("osascript failed: %s" % exc)
+        return None
+    lines = (proc.stdout or "").strip().splitlines()
+    return proc.returncode, (lines[-1].strip() if lines else ""), proc.stderr or ""
+
+
+def read_mac_answer(result):
+    """True to restore, False to keep, None when the dialog gave no answer.
+
+    Only the restore button restores. Keep, Escape and the timeout all keep
+    the newest save, the same as on the other two platforms.
+    """
+    if result is None:
+        return None
+    code, answer, err = result
+    if code == 0 and answer == "RESTORE":
+        return True
+    if code == 0 and answer in ("KEEP", "TIMEOUT"):
+        return False
+    log("mac dialog exit %s, answer %r, stderr=%r" % (code, answer, err[:200]))
+    return None
+
+
+def ask_mac(game, live_text, backup_label, backup_text, headline=None,
+            keep_label=None, restore_label=None, run=None):
+    """Ask on a Mac. True to restore, False to keep, None when nothing answered.
+
+    Keep is the default button and the timeout keeps too, the same rule as
+    the other two: only choosing the restore button rolls a save back.
+    """
+    text = conflict_text(game, live_text, backup_label, backup_text, headline)
+    extra = {"run": run} if run is not None else {}
+    result = run_osascript(
+        MAC_ASK, [text, "%s - Save conflict" % APP_TITLE,
+                  keep_label or KEEP_LABEL, restore_label or RESTORE_LABEL,
+                  DIALOG_TIMEOUT_SECONDS],
+        DIALOG_TIMEOUT_SECONDS + 30, **extra)
+    return read_mac_answer(result)
+
+
 def ask_user(game, live_mtime, backup_label, backup_mtime, **wording):
     live_text = human_time(live_mtime)
     backup_text = human_time(backup_mtime)
+    if remote_play():
+        # None is "nobody answered", which is never taken as consent.
+        log("Remote Play: not asking on the host (live=%s  %s=%s); nothing "
+            "restored, nothing decided" % (live_text, backup_label, backup_text))
+        return None
     log("asking: live=%s  %s=%s" % (live_text, backup_label, backup_text))
     if is_windows():
         return ask_windows(game, live_text, backup_label, backup_text, **wording)
+    if is_mac():
+        return ask_mac(game, live_text, backup_label, backup_text, **wording)
     return ask_linux(game, live_text, backup_label, backup_text, **wording)
 
 
@@ -1034,7 +1301,7 @@ def config_path():
     if is_windows():
         base = os.environ.get("APPDATA") or str(Path.home())
         return Path(base) / "savepick.json"
-    return Path.home() / ".config" / "savepick.json"
+    return real_home() / ".config" / "savepick.json"
 
 
 def load_config():
@@ -1469,6 +1736,17 @@ def folder_root(cfg):
     path = data.get("path")
     if not path:
         return None
+    return expand_home(path)
+
+
+def expand_home(path):
+    """Path(path).expanduser(), with ~ as the real home inside the snap.
+
+    Syncthing runs outside the snap and writes "~/Sync" meaning the person's
+    home. expanduser reads HOME, which snap Steam points at its own copy.
+    """
+    if in_snap() and (path == "~" or path.startswith("~/")):
+        return real_home() / path[2:]
     return Path(path).expanduser()
 
 
@@ -2373,6 +2651,8 @@ class Spinner:
         try:
             if is_windows():
                 self._start_windows(title, text)
+            elif is_mac():
+                self._start_mac(title, text)
             else:
                 self._start_linux(title, text)
         except Exception as exc:
@@ -2391,6 +2671,16 @@ class Spinner:
             cmd, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL, text=True, env=env)
 
+    def _start_mac(self, title, text):
+        # Cancel is AppleScript's own name for the button that stops the
+        # script, so pressing it ends osascript, which is what cancelled()
+        # watches for, as it watches zenity.
+        button = "Cancel" if self._cancellable else "Hide"
+        self._proc = subprocess.Popen(
+            osascript_command(MAC_SPINNER, [text, title, button]),
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL)
+
     def cancelled(self):
         """True once the user closed a cancellable spinner.
 
@@ -2399,7 +2689,13 @@ class Spinner:
         """
         if not self._cancellable or self._proc is None:
             return False
-        return self._proc.poll() is not None
+        code = self._proc.poll()
+        if is_mac():
+            # Cancel ends the script cleanly (exit 0). osascript that could
+            # not reach the window server fails at once instead, and that is
+            # no one pressing anything.
+            return code == 0
+        return code is not None
 
     def _start_windows(self, title, text):
         status = tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False,
@@ -2448,6 +2744,10 @@ class Spinner:
     def close(self):
         if self._status:
             self.update("__DONE__")
+        elif self._proc is not None and is_mac():
+            # A dialog has no end of input to close; osascript is stopped.
+            if self._proc.poll() is None:
+                self._proc.terminate()
         elif self._proc and self._proc.stdin:
             try:
                 self._proc.stdin.close()
@@ -2515,6 +2815,10 @@ WARNING_TIMEOUT_SECONDS = 60
 
 def show_warning(title, text):
     """A single-button warning. Never blocks a launch: it always times out."""
+    if remote_play():
+        log("Remote Play: warning NOT shown on the host: %s"
+            % text.replace("\n", " | "))
+        return
     log("warning shown: %s" % text.replace("\n", " | "))
     if is_windows():
         script = (WINDOWS_WARN
@@ -2522,6 +2826,12 @@ def show_warning(title, text):
                   .replace("__TEXT__", text)
                   .replace("__TIMEOUT__", str(WARNING_TIMEOUT_SECONDS)))
         run_powershell_dialog(script, watch_pad=True)
+        return
+    if is_mac():
+        result = run_osascript(MAC_WARN, [text, title, WARNING_TIMEOUT_SECONDS],
+                               WARNING_TIMEOUT_SECONDS + 30)
+        if result is not None and result[0] != 0:
+            log("warning dialog exit %s, stderr=%r" % (result[0], result[2][:200]))
         return
     for binary, env in zenity_candidates():
         cmd = [binary, "--warning", "--title=%s" % title,
@@ -2539,12 +2849,212 @@ def show_warning(title, text):
             return
 
 
+# ---------------------------------------------------------------------------
+# macOS preferences
+#
+# A Unity game on macOS keeps its save in ~/Library/Preferences/<domain>.plist
+# (Getting Over It: net.Foddy.GettingOverIt.plist). That file belongs to
+# cfprefsd, which holds every domain in memory. ludusavi only copies files, so
+# around each copy the domain is handed to cfprefsd the way Apple's `defaults`
+# tool does it:
+#
+#   before a backup   `defaults export <domain> -` is what cfprefsd holds. If
+#                     the file on disk says anything else, the export is
+#                     written over it, so ludusavi copies what the game saved.
+#   after a restore   `defaults delete <domain>`, then `defaults import
+#                     <domain> <copy>`, so cfprefsd drops what it cached and
+#                     the game starts on the restored save.
+#
+# Import alone is not enough: it MERGES into the domain. On a macOS VM (macOS
+# 26.6, 2026-09-28) a domain holding A and B, imported from a file holding
+# only C, came out as A, B and C. A key the restored save does not have would
+# survive into it. delete then import round-trips a binary plist to the same
+# bytes, which keeps the hash checks in store_restore meaningful.
+
+PREFERENCES_TIMEOUT_SECONDS = 30
+
+
+def is_macos():
+    """is_mac, under the name the preferences code and its tests use."""
+    return is_mac()
+
+
+def preferences_dir():
+    return os.path.join(str(Path.home()), "Library", "Preferences")
+
+
+def preference_domains(paths):
+    """(path, domain) for each path that is a top-level preferences plist.
+
+    Empty everywhere but macOS: the same path on Linux or Windows is just a
+    file. ByHost plists are left alone; no game known here uses them.
+    """
+    if not is_macos():
+        return []
+    prefs = os.path.normcase(os.path.abspath(preferences_dir()))
+    out = []
+    for path in paths:
+        path = str(path)
+        name = os.path.basename(path)
+        if not name.lower().endswith(".plist") or len(name) <= len(".plist"):
+            continue
+        if os.path.normcase(os.path.dirname(os.path.abspath(path))) != prefs:
+            continue
+        pair = (path, name[:-len(".plist")])
+        if pair not in out:
+            out.append(pair)
+    return out
+
+
+def run_defaults(args, timeout=PREFERENCES_TIMEOUT_SECONDS):
+    """Run /usr/bin/defaults. Returns (returncode, stdout bytes), or (None, b"")."""
+    try:
+        proc = subprocess.run(["/usr/bin/defaults"] + list(args), capture_output=True,
+                              timeout=timeout, stdin=subprocess.DEVNULL)
+    except (OSError, subprocess.SubprocessError) as exc:
+        log("prefs: defaults %s failed to run: %s" % (args[0], exc))
+        return None, b""
+    if proc.returncode != 0:
+        log("prefs: defaults %s exit %s: %s" % (
+            " ".join(args[:2]), proc.returncode,
+            (proc.stderr or b"").decode("utf-8", "replace").strip()[:200]))
+    return proc.returncode, proc.stdout or b""
+
+
+def read_plist_bytes(data):
+    import plistlib
+    try:
+        return plistlib.loads(data)
+    except Exception:
+        return None
+
+
+def read_file_bytes(path):
+    try:
+        with open(path, "rb") as handle:
+            return handle.read()
+    except OSError:
+        return None
+
+
+def domain_values(domain):
+    """What cfprefsd holds for `domain`, or None when it cannot be asked.
+
+    A domain that does not exist exports as an empty dict, not an error.
+    """
+    code, out = run_defaults(["export", domain, "-"])
+    if code != 0:
+        return None
+    return read_plist_bytes(out)
+
+
+def write_file_atomically(path, data):
+    """Replace `path` with `data`, 0600 like every file cfprefsd writes."""
+    tmp = "%s.blockslot-%d" % (path, os.getpid())
+    with open(tmp, "wb") as handle:
+        handle.write(data)
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, path)
+
+
+def flush_preferences(paths):
+    """Before a backup or a hash: make each plist on disk say what cfprefsd holds.
+
+    Never raises. A file already in step is not touched, so its bytes (and the
+    hash of an unchanged save) stay exactly what the game left.
+    """
+    for path, domain in preference_domains(paths):
+        try:
+            held = domain_values(domain)
+            if held is None:
+                log("prefs: cannot read %s from cfprefsd; backing up the file as is" % domain)
+                continue
+            on_disk = read_plist_bytes(read_file_bytes(path) or b"")
+            if held == on_disk:
+                continue
+            if not held:
+                # cfprefsd holding nothing while the file holds a save is not
+                # a reason to write an empty save over it.
+                log("prefs: cfprefsd holds nothing for %s; the file is kept" % domain)
+                continue
+            import plistlib
+            write_file_atomically(path, plistlib.dumps(held, fmt=plistlib.FMT_BINARY))
+            log("prefs: %s on disk was behind cfprefsd; flushed" % domain)
+        except Exception as exc:
+            log("prefs: flush of %s failed: %s" % (domain, exc))
+
+
+def reload_preferences(paths):
+    """After a restore: hand each restored plist to cfprefsd. True when all took.
+
+    The restored bytes are copied aside first. `defaults delete` empties the
+    file, so if the import then fails the copy is written back rather than
+    leaving the game an empty save.
+
+    The restored mtime is put back too. cfprefsd rewrites the file, which
+    stamps it with now, and ludusavi's restore kept the backup's mtime:
+    save_landed compares exactly that, and every device dates a save by it.
+    """
+    ok = True
+    for path, domain in preference_domains(paths):
+        restored = read_file_bytes(path)
+        if restored is None:
+            continue
+        try:
+            stat = os.stat(path)
+            times = (stat.st_atime, stat.st_mtime)
+        except OSError:
+            times = None
+        wanted = read_plist_bytes(restored)
+        if wanted is None:
+            log("prefs: %s is not a readable plist; not handed to cfprefsd" % path)
+            ok = False
+            continue
+        fd, copy = tempfile.mkstemp(prefix="blockslot-prefs-", suffix=".plist")
+        try:
+            with os.fdopen(fd, "wb") as handle:
+                handle.write(restored)
+            run_defaults(["delete", domain])
+            code, _out = run_defaults(["import", domain, copy])
+            held = domain_values(domain) if code == 0 else None
+            if held != wanted:
+                log("prefs: cfprefsd did not take the restored %s" % domain)
+                ok = False
+            else:
+                log("prefs: cfprefsd now holds the restored %s" % domain)
+            if read_file_bytes(path) != restored:
+                # Same values, other bytes (or a failed import): put back
+                # exactly what was restored, so hashes still match the backup.
+                write_file_atomically(path, restored)
+        except Exception as exc:
+            log("prefs: reload of %s failed: %s" % (domain, exc))
+            ok = False
+        finally:
+            try:
+                os.remove(copy)
+            except OSError:
+                pass
+            if times is not None:
+                try:
+                    os.utime(path, times)
+                except OSError as exc:
+                    log("prefs: cannot put back the mtime of %s: %s" % (path, exc))
+    return ok
+
+
+def settle_before_backup(game):
+    """flush_preferences for one game. Costs a ludusavi preview on macOS only."""
+    if is_macos():
+        flush_preferences(live_save_files(game))
+
+
 def run_backup(game):
     """Back this game up. Returns (failed, detail).
 
     stdin is closed for the same reason as run_json: a ludusavi that inherits
     a live pipe can sit waiting on it instead of working.
     """
+    settle_before_backup(game)
     cmd = [ludusavi_binary(), "--no-manifest-update", "backup", "--force", game]
     log("exit backup: %s" % " ".join(cmd))
     try:
@@ -2633,9 +3143,7 @@ def vault_root():
     if is_windows():
         base = os.environ.get("LOCALAPPDATA") or os.path.expanduser("~")
         return Path(base) / "savepick" / "vault"
-    base = os.environ.get("XDG_DATA_HOME") or os.path.join(
-        os.path.expanduser("~"), ".local", "share")
-    return Path(base) / "savepick" / "vault"
+    return xdg_home("XDG_DATA_HOME", ".local/share") / "savepick" / "vault"
 
 
 def vault_slug(text):
@@ -2807,6 +3315,9 @@ def restore_now(game, backup_mtime, backup_name, peer_dir):
         for path, info in (entry.get("files") or {}).items():
             if info.get("failed"):
                 log("restore FAILED: %s (%s)" % (path, info.get("error")))
+    if is_macos() and not reload_preferences(live_save_files(game)):
+        log("restore: a preferences save did not reach cfprefsd")
+        return False
     landed = save_landed(game, backup_mtime)
     log("restore: the save %s" % ("landed" if landed else "did NOT land"))
     return landed
@@ -2861,6 +3372,11 @@ CHILD = None
 SIGNALS_SEEN = []
 # One monotonic time, set when the first stop signal goes out.
 STOP_DEADLINE = []
+# The game's whole process tree when the stop signal arrived, as
+# (pid, start time) pairs. See wait_for_leftovers.
+STOP_TREE = []
+# How long a leftover gets to go on its own before the stop is passed to it.
+LEFTOVER_GRACE_SECONDS = 3
 # Set by main from --borderless: hold the game's window borderless.
 BORDERLESS = False
 
@@ -3441,7 +3957,18 @@ def wait_for_child(proc):
     A signal handler sets STOP_DEADLINE. Until then this waits as long as the
     session lasts. After it, the game gets GAME_STOP_SECONDS to close its
     save files, then it is killed, so the exit backup still runs.
+
+    After a stop, the rest of the game's tree is waited for too: what savepick
+    starts is often only a launcher (see wait_for_leftovers).
     """
+    code = wait_for_launcher(proc)
+    if STOP_TREE:
+        wait_for_leftovers()
+    return code
+
+
+def wait_for_launcher(proc):
+    """wait_for_child for the one process savepick started."""
     while True:
         try:
             return proc.wait(timeout=1)
@@ -3491,10 +4018,55 @@ def warn_unconfirmed(synced):
                  % (head, hub))
 
 
-def split_command(argv):
+def split_command(argv, exists=None):
     if "--" not in argv:
         return []
-    return argv[argv.index("--") + 1:]
+    command = argv[argv.index("--") + 1:]
+    if is_mac():
+        command = mac_command(command, exists)
+    return command
+
+
+def mac_command(command, exists=None, is_dir=None):
+    """The game's command line as a Mac can start it.
+
+    Steam is expected to hand over the binary inside the game's .app. If it
+    hands over the .app itself, a folder cannot be run, so it goes through
+    `open -W`, which starts it the way Finder would and waits for it to quit,
+    so the exit backup still waits for the game.
+    """
+    is_dir = is_dir or os.path.isdir
+    command = rejoin_program(command, exists)
+    if not command:
+        return command
+    head = command[0]
+    if not (exists or os.path.isfile)(head):
+        for end in range(1, len(command) + 1):
+            joined = " ".join(command[:end])
+            if joined.rstrip("/").endswith(".app") and is_dir(joined):
+                return (["/usr/bin/open", "-W", joined]
+                        + (["--args"] + command[end:] if command[end:] else []))
+    return command
+
+
+def rejoin_program(command, exists=None):
+    """Put a program path split at its spaces back together.
+
+    On a Mac, %command% names the binary inside the game's .app, under
+    "Application Support" and usually a folder named after the game, so it
+    has spaces in it. If the words arrive split, the first one names no file
+    and the game would not start; the shortest run of words that does name
+    one is the program. A command whose first word is already a file is left
+    exactly as it is.
+    """
+    exists = exists or os.path.isfile
+    if not command or exists(command[0]):
+        return command
+    for end in range(2, len(command) + 1):
+        joined = " ".join(command[:end])
+        if exists(joined):
+            return [joined] + command[end:]
+    return command
 
 
 def head_of(argv):
@@ -3518,6 +4090,142 @@ def tree_name(argv):
     return argv[index]
 
 
+def process_table():
+    """{pid: parent pid} for every process, or {} when it cannot be read.
+
+    /proc on Linux; `ps` on a Mac. Windows is not asked: there the game is
+    the process savepick started.
+    """
+    table = {}
+    if is_windows():
+        return table
+    if os.path.isdir("/proc/self"):
+        for name in os.listdir("/proc"):
+            if not name.isdigit():
+                continue
+            stat = proc_stat(int(name))
+            if stat is not None:
+                table[int(name)] = stat[1]
+        return table
+    try:
+        out = subprocess.run(["ps", "-A", "-o", "pid=", "-o", "ppid="],
+                             capture_output=True, text=True, timeout=10).stdout
+    except (OSError, subprocess.SubprocessError):
+        return table
+    for line in out.splitlines():
+        parts = line.split()
+        if len(parts) == 2 and parts[0].isdigit() and parts[1].isdigit():
+            table[int(parts[0])] = int(parts[1])
+    return table
+
+
+def proc_stat(pid):
+    """(state, parent pid, start time) from /proc/<pid>/stat, or None."""
+    try:
+        with open("/proc/%d/stat" % pid, "r") as handle:
+            text = handle.read()
+    except (OSError, ValueError):
+        return None
+    # The name is in brackets and may hold spaces or brackets itself.
+    fields = text[text.rfind(")") + 2:].split()
+    try:
+        return fields[0], int(fields[1]), fields[19]
+    except (IndexError, ValueError):
+        return None
+
+
+def descendants(pid, table=None):
+    """Every process below `pid`, parents before children."""
+    table = process_table() if table is None else table
+    children = {}
+    for child, parent in table.items():
+        children.setdefault(parent, []).append(child)
+    out, todo = [], [pid]
+    while todo:
+        for child in sorted(children.get(todo.pop(0), [])):
+            if child not in out and child != pid:
+                out.append(child)
+                todo.append(child)
+    return out
+
+
+def start_of(pid):
+    """What tells this process apart from a later one given the same pid."""
+    stat = proc_stat(pid)
+    return stat[2] if stat else None
+
+
+def still_running(pid, start):
+    """True while the process recorded as (pid, start) has not ended."""
+    stat = proc_stat(pid)
+    if stat is not None:
+        return stat[0] not in ("Z", "X") and (start is None or stat[2] == start)
+    if os.path.isdir("/proc/self"):
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except OSError:
+        return True
+    return True
+
+
+def wait_for_leftovers():
+    """Stop what is left of the game after the process savepick started ended.
+
+    On Linux Steam's command is a chain: steam-launch-wrapper, reaper, the
+    runtime's pressure-vessel, and only then the game. A stop signal that
+    reaches savepick alone (a `kill`, a logout, a service manager) was passed
+    to steam-launch-wrapper, which died of it at once and did NOT pass it on.
+    Seen on a Linux laptop on 2026-09-28: "the game exited with -15", the exit
+    backup ran, and Getting Over It kept running under Steam for three more
+    minutes. The backup was of a game still playing, whatever it saved
+    after that went nowhere, and Steam still showed the game as running, so
+    another device's Play button turned into "Stream from" that machine.
+
+    So the tree is recorded when the signal arrives. Whatever of it outlives
+    the launcher gets a moment to finish on its own (Steam usually signals
+    all of it), then the same signal, then a kill at the usual deadline.
+    """
+    import signal
+    tree = list(STOP_TREE)
+    del STOP_TREE[:]
+
+    def left():
+        return [(pid, start) for pid, start in tree if still_running(pid, start)]
+
+    def wait_until(deadline):
+        while left() and time.monotonic() < deadline:
+            time.sleep(0.2)
+        return left()
+
+    deadline = STOP_DEADLINE[0] if STOP_DEADLINE else time.monotonic() + GAME_STOP_SECONDS
+    rest = wait_until(min(deadline, time.monotonic() + LEFTOVER_GRACE_SECONDS))
+    if not rest:
+        return
+    signum = SIGNALS_SEEN[0] if SIGNALS_SEEN else signal.SIGTERM
+    log("the game outlived its launcher (pids %s); passing signal %s on"
+        % (" ".join(str(pid) for pid, _start in rest), signum))
+    for pid, _start in rest:
+        try:
+            os.kill(pid, signum)
+        except OSError:
+            pass
+    rest = wait_until(max(deadline, time.monotonic() + 1))
+    if not rest:
+        log("the rest of the game has stopped")
+        return
+    log("the rest of the game did not stop; killing pids %s"
+        % " ".join(str(pid) for pid, _start in rest))
+    for pid, _start in rest:
+        try:
+            os.kill(pid, getattr(signal, "SIGKILL", signum))
+        except OSError:
+            pass
+    wait_until(time.monotonic() + 5)
+
+
 def stop_child(signum):
     """Pass a stop signal to the game, and start the clock on its grace period."""
     global STOP_DEADLINE
@@ -3526,6 +4234,14 @@ def stop_child(signum):
     proc = CHILD
     if proc is None or proc.poll() is not None:
         return False
+    pid = getattr(proc, "pid", None)
+    if isinstance(pid, int) and not STOP_TREE and not is_windows():
+        # Before the signal: once the launcher dies, its orphans belong to
+        # someone else and nothing links them to this game any more.
+        try:
+            STOP_TREE[:] = [(child, start_of(child)) for child in descendants(pid)]
+        except Exception as exc:
+            log("could not read the game's process tree: %s" % exc)
     try:
         proc.send_signal(signum)
     except OSError as exc:
@@ -3592,6 +4308,40 @@ def store_worker():
     return worker, slotstore.store_name(store_settings())
 
 
+# What starts a Windows game on Linux or a Mac. Steam's own command for a
+# Proton game runs `.../Proton 9.0/proton waitforexitandrun .../Game.exe`.
+WINE_LAUNCHERS = ("proton", "wine", "wine64", "wine-preloader", "wine64-preloader",
+                  "umu-run")
+
+
+def runs_under_wine(command):
+    """True when the launch command runs a Windows build through Wine/Proton."""
+    if is_windows():
+        return False
+    for arg in command or []:
+        name = str(arg).replace("\\", "/").rstrip("/").rsplit("/", 1)[-1].lower()
+        if name in WINE_LAUNCHERS:
+            return True
+    return False
+
+
+def save_family(command, live_paths):
+    """The OS family of this device's save of a game: which OS's BUILD runs.
+
+    Each family keeps its own history on the store (see slotstore). A Windows
+    game under Proton on the Deck is "windows", like the same game on a
+    Windows PC, and ludusavi carries its save between the Wine prefix and
+    Windows. A native build is the host's own OS.
+    """
+    here = str(Path(__file__).resolve().parent)
+    if here not in sys.path:
+        sys.path.insert(0, here)
+    import slotstore
+    if runs_under_wine(command):
+        return slotstore.WINDOWS
+    return slotstore.paths_family(live_paths) or slotstore.host_family()
+
+
 def hash_files(paths):
     """SHA-256 of each save file. What "the same save" means across devices."""
     import hashlib
@@ -3641,8 +4391,9 @@ def played_end_ts(choice):
 class KeepAwake(object):
     """Ask the OS not to sleep while a save uploads.
 
-    Windows honours ES_SYSTEM_REQUIRED against idle sleep. A lid or a power
-    button still wins; logind's delay inhibitor buys a few seconds on Linux.
+    Windows honours ES_SYSTEM_REQUIRED against idle sleep, and a Mac honours
+    caffeinate -i. A lid or a power button still wins; logind's delay
+    inhibitor buys a few seconds on Linux.
     Either way the queue is on disk, so a cut-off upload carries on at wake.
     """
 
@@ -3658,6 +4409,12 @@ class KeepAwake(object):
                 ctypes.windll.kernel32.SetThreadExecutionState(
                     ES_CONTINUOUS | ES_SYSTEM_REQUIRED)
                 self.windows = True
+            elif is_mac():
+                # caffeinate -i holds off idle sleep, like ES_SYSTEM_REQUIRED.
+                self.proc = subprocess.Popen(
+                    ["/usr/bin/caffeinate", "-i", "-t", "600"],
+                    stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL)
             elif shutil.which("systemd-inhibit"):
                 self.proc = subprocess.Popen(
                     ["systemd-inhibit", "--what=sleep", "--mode=delay",
@@ -3692,7 +4449,8 @@ def handoff_dir(prefix):
     Temp folder's ACL, which names this user.
     """
     import secrets
-    path = os.path.join(tempfile.gettempdir(), "%s%s" % (prefix, secrets.token_hex(6)))
+    path = os.path.join(handoff_parent() or tempfile.gettempdir(),
+                        "%s%s" % (prefix, secrets.token_hex(6)))
     os.makedirs(path)
     return path
 
@@ -3713,8 +4471,9 @@ def store_restore(worker, game, choice, live_paths):
             log("restoring (attempt %d): %s" % (attempt, " ".join(args)))
             log_restore_answer(game, run_json(args, timeout=RESTORE_TIMEOUT_SECONDS))
             live = live_save_files(game)
+            took = reload_preferences(live)
             landed = hash_files(live)
-            ok = bool(wanted) and wanted <= landed
+            ok = took and bool(wanted) and wanted <= landed
             if ok:
                 break
             # Say exactly what is on disk, so the next failure explains
@@ -3752,18 +4511,25 @@ def log_restore_answer(game, data):
                                   (" FAILED: %s" % info.get("error")) if info.get("failed") else ""))
 
 
-def store_before_launch(worker, name, game):
-    """Everything before the game starts. Never raises; never blocks for long."""
+def store_before_launch(worker, name, game, command=None):
+    """Everything before the game starts. Never raises; never blocks for long.
+
+    Returns the OS family this launch plays the game as, for the exit upload
+    to record, or None when it could not be worked out.
+    """
     spinner = Spinner(APP_TITLE, "Checking %s ..." % name)
+    family = None
     try:
         live_paths = live_save_files(game)
-        answer = worker.decide(game, sorted(hash_files(live_paths)))
+        flush_preferences(live_paths)
+        family = save_family(command, live_paths)
+        answer = worker.decide(game, sorted(hash_files(live_paths)), os_family=family)
     except Exception as exc:
         answer = {"action": "unknown", "error": str(exc)}
     finally:
         spinner.close()
     action = answer.get("action")
-    log("store: %s -> %s" % (game, action))
+    log("store: %s -> %s (%s saves)" % (game, action, family or "unknown OS"))
 
     if action == "unknown":
         show_warning(APP_TITLE,
@@ -3771,11 +4537,11 @@ def store_before_launch(worker, name, game):
                      "%s starts on the save that is on this device. If you\n"
                      "played somewhere else since, quit now and let it sync."
                      % (name, answer.get("error") or "", game))
-        return
+        return family
     if action == "launch":
         if answer.get("adopt"):
             worker.set_base(game, answer["adopt"])
-        return
+        return family
     if action == "restore":
         choice = answer["restore"]
         spinner = Spinner(APP_TITLE, "Getting your %s save for %s ..."
@@ -3786,7 +4552,7 @@ def store_before_launch(worker, name, game):
             spinner.close()
         if not landed:
             warn_restore_incomplete(game)
-        return
+        return family
     if action == "wait":
         pending = answer.get("pending") or [{}]
         who = pending[0].get("device") or "another device"
@@ -3796,12 +4562,12 @@ def store_before_launch(worker, name, game):
                      "Playing here now starts from an older save. Quit, let\n"
                      "%s finish, then start the game again."
                      % (who, game, who))
-        return
+        return family
     if action == "ask":
         choices = sorted(answer.get("choices") or [], key=lambda c: played_end_ts(c) or 0)
         other = choices[-1] if choices else None
         if other is None:
-            return
+            return family
         live_mtime = newest_live_mtime(live_paths)
         picked = ask_user(game, live_mtime, "%s save" % other.get("device"),
                           played_end_ts(other),
@@ -3817,17 +4583,27 @@ def store_before_launch(worker, name, game):
                 spinner.close()
             if not landed:
                 warn_restore_incomplete(game)
+        elif picked is None and remote_play():
+            # Nobody was asked, so nothing is decided: the fork stays open and
+            # the next launch in front of a screen asks again.
+            log("store: Remote Play; both saves stay, the next local launch asks")
         else:
             # Keeping this device is a decision too. The next save names every
             # other head as a parent, so the fork closes when it uploads.
             log("store: kept this device over %s" % other["id"])
             losers = [c["id"] for c in choices]
             worker.set_base(game, answer.get("base"), merge=losers)
+    return family
 
 
-def store_after_exit(worker, name, game, played, mode="game", started_on=None):
-    """Back up, hand the save to the daemon, and say plainly where it is."""
-    where = tempfile.mkdtemp(prefix="blockslot-backup-")
+def store_after_exit(worker, name, game, played, mode="game", started_on=None,
+                     os_family=None):
+    """Back up, hand the save to the daemon, and say plainly where it is.
+
+    `os_family` is what store_before_launch worked out. None lets the daemon
+    read it from ludusavi's mapping.yaml in the backup."""
+    settle_before_backup(game)
+    where = tempfile.mkdtemp(prefix="blockslot-backup-", dir=handoff_parent())
     try:
         cmd = [ludusavi_binary(), "--no-manifest-update", "backup", "--force",
                "--path", where, game]
@@ -3850,7 +4626,8 @@ def store_after_exit(worker, name, game, played, mode="game", started_on=None):
             # no parent and made a second DS2 head for no reason.
             log("store: %s did not change this session; nothing to upload" % game)
             return
-        staged = worker.stage(game, where, played=played, mode=mode)
+        staged = worker.stage(game, where, played=played, mode=mode,
+                              os_family=os_family)
     finally:
         shutil.rmtree(where, ignore_errors=True)
 
@@ -3964,6 +4741,11 @@ def store_library_before_launch(worker, name, game, root):
                                   keep_label="Keep this device",
                                   restore_label="Use the %s save" % other.get("device"))
                 spinner = Spinner(APP_TITLE, "Getting the %s save ..." % other.get("device"))
+                if picked is None and remote_play():
+                    # Undecided, not kept: the next local launch asks again.
+                    asked.append(((choices[-1].get("unit") or {}).get("title"))
+                                 or unit_name)
+                    continue
                 if picked is not True:
                     worker.set_base(unit_name, None, merge=[c["id"] for c in choices])
                     continue
@@ -4038,7 +4820,7 @@ def store_library_after_exit(worker, name, game, root, before, played):
         return
     last = None
     for unit in changed:
-        where = tempfile.mkdtemp(prefix="blockslot-unit-")
+        where = tempfile.mkdtemp(prefix="blockslot-unit-", dir=handoff_parent())
         try:
             for rel in after[unit]["rels"]:
                 target = Path(where) / rel
@@ -4142,7 +4924,7 @@ def main_store(game, command):
         show_warning(APP_TITLE, "The save store is not working:\n%s\n\n"
                      "%s starts on the save on this device." % (name, game))
         return launch(command)
-    store_before_launch(worker, name, game)
+    family = store_before_launch(worker, name, game, command=command)
     try:
         started_on = hash_files(live_save_files(game))
     except Exception as exc:
@@ -4153,7 +4935,8 @@ def main_store(game, command):
     played = {"start": started,
               "end": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")}
     try:
-        store_after_exit(worker, name, game, played, started_on=started_on)
+        store_after_exit(worker, name, game, played, started_on=started_on,
+                         os_family=family)
     except Exception as exc:
         log("store: exit step failed: %s" % exc)
     return code
@@ -4217,10 +5000,24 @@ def main_tree(game, command, dry_run=False):
     return code
 
 
+def started_line(env):
+    """The first log line of a launch: which game, and whether it streams."""
+    appid = env.get("SteamAppId") or env.get("SteamGameId") or "no SteamAppId"
+    line = "started (pid %d) for steam app %s" % (os.getpid(), appid)
+    if remote_play(env):
+        line += ("; Remote Play: streaming to a client at %s, so no dialog is "
+                 "shown on this host"
+                 % (env.get("SteamStreamingMaximumResolution") or "unknown size"))
+    return line
+
+
 def main(argv):
     global BORDERLESS
     hide_own_console()
     trace_signals()
+    # First, before anything that can fail: a launch that reached savepick
+    # always leaves a line, so a launch with no line never reached it.
+    log(started_line(os.environ))
     command = split_command(argv)
     if not command:
         log("no game command given after --; nothing to launch")
@@ -4266,6 +5063,7 @@ def main(argv):
         return code
 
     live_paths = live_save_files(game)
+    flush_preferences(live_paths)
     live_mtime = newest_live_mtime(live_paths)
     basenames = {Path(p).name for p in live_paths}
     backup_label, backup_mtime, backup_name, peer_dir = newest_backup_info(

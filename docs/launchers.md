@@ -129,6 +129,8 @@ other, all of them dead paths.
 
 ## Checklist
 
+This is the Syncthing path. The store path is shorter, below.
+
 1. Confirm the launcher owns saves at all.
 2. Find the root on each device, resolving symlinks.
 3. Add a ludusavi custom game with the same name on every device.
@@ -139,6 +141,25 @@ other, all of them dead paths.
 7. **Dry run before it writes.** Read the plan. Hundreds of files means a layout clash or
    a wrong root, not a first sync.
 8. Add the aliases the dry run reveals, and dry run again.
+
+### With a store
+
+When `savepick.json` has a `store` section, a library is not copied through
+ludusavi or Syncthing. The engine reads the root itself, splits it into one
+save per game, and uploads only the games whose files changed this session.
+So steps 3, 6 and 7 fall away.
+
+- Add the library on the server's **Settings** page, or paste a device's
+  `trees` block there. Every device reads it from the store.
+- `roots` is keyed by each device's name on the store: `store.device`, else
+  the Syncthing `device_dir`, else the host name.
+- Emulator saves are the same file on every OS, so library games belong to
+  every OS's history.
+
+One gap is known. The window's **Emulator games** screen still keys this
+device's folder by the Syncthing `device_dir`, and a device set up with only a
+store has no Sync screen to set one on. Until that is fixed, give such a
+device its root on the server's Settings page or by hand in `savepick.json`.
 
 ## Wiring one emulator into a frontend, rather than the frontend itself
 

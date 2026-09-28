@@ -228,7 +228,9 @@ class SaveSetsScreen(app_mod.Screen):
     def _render(self, canvas, row, y, width, height, is_cursor):
         middle = y + height / 2
         left = self.metrics.pad
-        canvas.create_text(left, middle - self.metrics.small * 0.85, anchor="w",
+        canvas.create_text(left,
+                           middle - self.metrics.px(self.metrics.small * 0.85),
+                           anchor="w",
                            text=row.name, fill=theme.TEXT,
                            font=self.metrics.font(bold=is_cursor))
         spec = self.metrics.font("small")
@@ -237,7 +239,9 @@ class SaveSetsScreen(app_mod.Screen):
             text, colour = "%s   %s" % (kind, row.root), theme.TEXT_DIM
         else:
             text, colour = "%s   no folder here yet" % kind, theme.WARN
-        canvas.create_text(left, middle + self.metrics.small * 0.95, anchor="w",
+        canvas.create_text(left,
+                           middle + self.metrics.px(self.metrics.small * 0.95),
+                           anchor="w",
                            text=widgets.elide(text, spec,
                                               width - left * 2),
                            fill=colour, font=spec)
@@ -252,7 +256,8 @@ class SaveSetsScreen(app_mod.Screen):
             pill_h = int(22 * self.metrics.scale)
             pill_w = widgets.width_of(marker, spec) + int(18 * self.metrics.scale)
             x = right - pill_w
-            top = middle - self.metrics.small * 0.85 - pill_h / 2
+            top = (middle - self.metrics.px(self.metrics.small * 0.85)
+                   - pill_h / 2)
             widgets.round_rect(canvas, x, top, right, top + pill_h, pill_h / 2,
                                fill=theme.WARN, outline="")
             canvas.create_text(x + pill_w / 2, top + pill_h / 2, text=marker,
@@ -260,11 +265,15 @@ class SaveSetsScreen(app_mod.Screen):
                                font=self.metrics.font("small", bold=True))
             right = x - int(8 * self.metrics.scale)
         title_spec = self.metrics.font(bold=is_cursor)
-        canvas.create_text(left, middle - self.metrics.small * 0.85, anchor="w",
+        canvas.create_text(left,
+                           middle - self.metrics.px(self.metrics.small * 0.85),
+                           anchor="w",
                            text=widgets.elide(title, title_spec, right - left),
                            fill=theme.TEXT, font=title_spec)
         second = "   ".join(part for part in (label, saved) if part)
-        canvas.create_text(left, middle + self.metrics.small * 0.95, anchor="w",
+        canvas.create_text(left,
+                           middle + self.metrics.px(self.metrics.small * 0.95),
+                           anchor="w",
                            text=widgets.elide(second, spec, width - left * 2),
                            fill=theme.TEXT_DIM, font=spec)
 
@@ -360,11 +369,9 @@ class SaveSetsScreen(app_mod.Screen):
                          daemon=True).start()
 
     def _later(self, callback, *args):
-        """Hand a worker's answer to the Tk thread. The window may be gone."""
-        try:
-            self.app.after(0, callback, *args)
-        except (RuntimeError, tk.TclError):
-            pass
+        """Hand a worker's answer to the Tk thread (App.post: never Tk from
+        a worker). If the window is gone by then, nobody collects it."""
+        self.app.post(callback, *args)
 
     def _read_worker(self, library):
         try:

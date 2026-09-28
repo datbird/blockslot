@@ -17,6 +17,8 @@ import unittest
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 
+# A test run on a Mac must never write the login Keychain (slotd.protect).
+os.environ["BLOCKSLOT_NO_KEYCHAIN"] = "1"
 ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
@@ -1145,6 +1147,216 @@ class TheLibraryFromTheExe(Temp):
         self.assertEqual([entry.name for entry in found], ["BlockSlot"])
 
 
+MAC_APP = "/Applications/Blockslot.app/Contents/MacOS/Blockslot"
+
+
+def fake_mac(test, frozen=True, executable=MAC_APP):
+    """Make paths answer as a Mac does, frozen or from source."""
+    for name, value in (("is_frozen", lambda: frozen),
+                        ("is_windows", lambda: False),
+                        ("is_mac", lambda: True),
+                        ("is_linux", lambda: False)):
+        test.addCleanup(setattr, paths, name, getattr(paths, name))
+        setattr(paths, name, value)
+    test.addCleanup(setattr, sys, "executable", sys.executable)
+    sys.executable = executable
+
+
+def no_python_but_the_stub(test, stub_works=False):
+    """A Mac whose only python is /usr/bin/python3, with or without the
+    developer tools behind it. Nothing is asked of this machine's disk."""
+    for name, value in (("mac_stub_works", lambda *a, **k: stub_works),
+                        ("MAC_PYTHONS", ())):
+        test.addCleanup(setattr, paths, name, getattr(paths, name))
+        setattr(paths, name, value)
+
+
+class TheLibraryFromTheMacApp(Temp):
+    """The built Mac app hosts the engine, as Blockslot.exe does, so a wrap
+    never names a python: on a Mac without the developer tools the only one
+    is the /usr/bin/python3 stub, which opens Apple's install dialog."""
+
+    def setUp(self):
+        Temp.setUp(self)
+        self.root = build_steam(self.dir / "Steam")
+        fake_mac(self)
+        # Asking for a python at all is the bug: fail loudly if anything does.
+        self.addCleanup(setattr, paths, "python_for_launch",
+                        paths.python_for_launch)
+        paths.python_for_launch = self._no_python
+        self.exe = str(Path(MAC_APP))
+        self.library = model.Library(root=self.root, user_id=40000001,
+                                     settings=settings.Settings(data={}))
+        self.library.steam_running = lambda: False
+        self.library.load()
+
+    @staticmethod
+    def _no_python():
+        raise AssertionError("the Mac app named a python in a launch option")
+
+    def _rows(self, plan):
+        self.library.apply(plan[0], plan[1])
+        self.library.load()
+        return {row.appid: row for row in self.library.rows}
+
+    def test_the_engine_is_in_the_app(self):
+        self.assertTrue(paths.engine_in_exe())
+        self.assertEqual(paths.launch_program(), Path(MAC_APP))
+
+    def test_a_wrap_names_the_binary_inside_the_app_with_pick(self):
+        steam_changes, _ = self.library.plan([220], True)
+        self.assertEqual(steam_changes[220],
+                         self.exe + " --pick -- -novid %command%")
+
+    def test_planning_a_second_time_changes_nothing(self):
+        self._rows(self.library.plan([220], True))
+        self.assertEqual(self.library.plan([220], True), ({}, []))
+
+    def test_an_app_in_a_folder_with_a_space_is_quoted(self):
+        sys.executable = "/Users/p/My Apps/Blockslot.app/Contents/MacOS/Blockslot"
+        steam_changes, _ = self.library.plan([220], True)
+        self.assertEqual(steam_changes[220],
+                         '"%s" --pick -- -novid %%command%%'
+                         % Path(sys.executable))
+        rows = self._rows((steam_changes, []))
+        self.assertTrue(rows[220].syncing)
+
+    def test_an_old_python_wrap_is_rewrapped_with_the_app(self):
+        old = wrap.build("/usr/bin/python3", "/Users/p/.local/bin/savepick.py",
+                         "-novid %command%")
+        rows = self._rows(({220: old}, []))
+        self.assertTrue(rows[220].wrapped)
+        steam_changes, _ = self.library.plan([220], True)
+        self.assertEqual(steam_changes[220],
+                         self.exe + " --pick -- -novid %command%")
+
+    def test_removing_gives_the_option_back(self):
+        self._rows(self.library.plan([220], True))
+        rows = self._rows(self.library.plan([220], False))
+        self.assertFalse(rows[220].wrapped)
+        self.assertEqual(rows[220].launch_options, "-novid %command%")
+
+
+class TheMacAppsLaunchOptionText(unittest.TestCase):
+    def test_the_app_form_is_recognised(self):
+        value = MAC_APP + " --pick --borderless -- -x %command%"
+        self.assertTrue(wrap.is_wrapped(value))
+        self.assertEqual(wrap.engine_of(value), MAC_APP)
+        self.assertIsNone(wrap.python_of(value))
+        self.assertTrue(wrap.borderless_of(value))
+        self.assertEqual(wrap.strip(value), "-x %command%")
+
+    def test_a_players_own_pick_switch_is_not_ours(self):
+        self.assertFalse(wrap.is_wrapped("/usr/local/bin/tool --pick -- %command%"))
+        self.assertFalse(wrap.is_wrapped(
+            "/Applications/Tool.app/Contents/Resources/tool --pick -- %command%"))
+
+
+class NoStubOnAMac(unittest.TestCase):
+    """/usr/bin/python3 on a Mac with no developer tools is an installer."""
+
+    def test_the_stub_alone_is_never_named(self):
+        fake_mac(self, frozen=False, executable="/x/PluginLoader")
+        no_python_but_the_stub(self)
+        with self.assertRaises(paths.NoRealPython):
+            paths.python_for_launch()
+
+    def test_the_stub_is_named_when_the_tools_stand_behind_it(self):
+        fake_mac(self, frozen=False, executable="/x/PluginLoader")
+        no_python_but_the_stub(self, stub_works=True)
+        self.assertEqual(paths.python_for_launch(), Path(paths.MAC_STUB))
+
+    def test_a_real_running_python_is_named(self):
+        fake_mac(self, frozen=False, executable="/opt/homebrew/bin/python3.13")
+        no_python_but_the_stub(self)
+        self.assertEqual(paths.python_for_launch(),
+                         Path("/opt/homebrew/bin/python3.13"))
+
+    def test_a_source_run_refuses_to_wrap_with_the_stub(self):
+        tmp = Path(tempfile.mkdtemp(prefix="blockslot-test-"))
+        self.addCleanup(shutil.rmtree, str(tmp), True)
+        fake_mac(self, frozen=False, executable="/x/PluginLoader")
+        no_python_but_the_stub(self)
+        library = model.Library(root=build_steam(tmp / "Steam"),
+                                user_id=40000001,
+                                settings=settings.Settings(data={}))
+        library.steam_running = lambda: False
+        library.load()
+        with self.assertRaises(paths.NoRealPython):
+            library.plan([220], True)
+
+    def test_an_xcode_that_xcode_select_names_counts(self):
+        xcode = "/Users/p/Xcode-beta.app/Contents/Developer"
+        found = {xcode + "/usr/bin/python3"}
+        self.assertFalse(paths.mac_stub_works(found.__contains__))
+        self.assertTrue(paths.mac_stub_works(found.__contains__, selected=xcode))
+
+    def test_xcode_select_is_never_asked_off_a_mac(self):
+        if sys.platform == "darwin":
+            self.skipTest("this is a Mac")
+        self.assertIsNone(paths.mac_selected_developer_dir())
+
+
+class TheMacsTemporaryPlaces(unittest.TestCase):
+    TRANSLOCATED = ("/private/var/folders/ab/xyz/T/AppTranslocation/"
+                    "0A1B2C3D/d/Blockslot.app/Contents/MacOS/Blockslot")
+    DISK_IMAGE = "/Volumes/BlockSlot/Blockslot.app/Contents/MacOS/Blockslot"
+
+    def test_a_translocated_app_is_temporary(self):
+        fake_mac(self)
+        self.assertTrue(paths.in_temporary_place(self.TRANSLOCATED))
+
+    def test_an_app_on_a_disk_image_is_temporary(self):
+        fake_mac(self)
+        self.assertTrue(paths.in_temporary_place(self.DISK_IMAGE))
+
+    def test_an_app_in_applications_is_not(self):
+        fake_mac(self)
+        self.assertFalse(paths.in_temporary_place(MAC_APP))
+        self.assertFalse(paths.in_temporary_place(
+            "/Users/p/Applications/Blockslot.app/Contents/MacOS/Blockslot"))
+
+    def test_the_advice_is_to_move_it_to_applications(self):
+        fake_mac(self)
+        self.assertIn("Applications", paths.temporary_advice())
+        self.assertNotIn(".exe", paths.temporary_advice())
+
+    def test_elsewhere_a_folder_called_volumes_is_just_a_folder(self):
+        self.addCleanup(setattr, paths, "is_mac", paths.is_mac)
+        paths.is_mac = lambda: False
+        self.assertFalse(paths.in_temporary_place(self.DISK_IMAGE))
+
+
+class TheMacBuild(unittest.TestCase):
+    """tools/build_exe.py's command line, which only a Mac can run."""
+
+    def setUp(self):
+        sys.path.insert(0, str(ROOT / "tools"))
+        self.addCleanup(sys.path.remove, str(ROOT / "tools"))
+        import build_exe
+        self.build = build_exe
+
+    def test_the_mac_build_is_an_arm64_app_bundle(self):
+        command = self.build.build_command(mac=True)
+        self.assertNotIn("--onefile", command)
+        self.assertIn("--windowed", command)
+        self.assertEqual(command[command.index("--target-arch") + 1], "arm64")
+        self.assertEqual(command[command.index("--osx-bundle-identifier") + 1],
+                         "com.datbird.blockslot")
+        icon = Path(command[command.index("--icon") + 1])
+        self.assertEqual(icon.name, "blockslot.icns")
+        with open(str(icon), "rb") as handle:
+            self.assertEqual(handle.read(4), b"icns")
+
+    def test_windows_and_linux_stay_one_file(self):
+        self.assertIn("--onefile", self.build.build_command(mac=False))
+
+    def test_the_bundle_version_comes_from_the_tag(self):
+        self.assertEqual(self.build.plain_version("v1.0.1"), "1.0.1")
+        self.assertIsNone(self.build.plain_version("main"))
+        self.assertIsNone(self.build.plain_version(None))
+
+
 class TheTemporaryPlace(Temp):
     def test_the_temp_folder_is_temporary(self):
         import tempfile
@@ -1641,6 +1853,219 @@ class StoreSettings(Temp):
         self.assertEqual(conf.store_device(), socket.gethostname())
         conf.set_store(device="desktop")
         self.assertEqual(conf.store_device(), "desktop")
+
+    def test_the_device_name_is_read_in_the_order_slotd_reads_it(self):
+        conf = settings.Settings(data={"syncthing": {"device_dir": "deck"}})
+        self.assertEqual(conf.store_device(), "deck")
+        conf.data["device"] = "top"
+        self.assertEqual(conf.store_device(), "top")
+        conf.data["store"] = {"type": "s3", "device": "imac"}
+        self.assertEqual(conf.store_device(), "imac")
+
+
+
+class FakeRoot(object):
+    """Just what uiscale.for_window reads from a Tk window."""
+
+    def __init__(self, windowing, scaling):
+        self.answers = {"windowingsystem": windowing, "scaling": scaling}
+        self.tk = self
+
+    def call(self, *args):
+        return self.answers[args[1]]
+
+    def winfo_screen(self):
+        return ":0.0"
+
+
+class UiScale(unittest.TestCase):
+    """The factor pixel sizes are grown by, the one fonts already get."""
+
+    def setUp(self):
+        from gui.core import uiscale
+        self.uiscale = uiscale
+
+    def scale(self, windowing, scaling, xft=None, environ=None):
+        return self.uiscale.for_window(FakeRoot(windowing, scaling),
+                                       environ=environ or {},
+                                       xft_reader=lambda display: xft)
+
+    def test_a_laptop_under_xwayland_at_200_percent(self):
+        # Measured on a Linux laptop, GNOME 50 at 200 percent: tk scaling 1.3339
+        # (96 dpi, so Tk's own idea is 100 percent) and Xft.dpi 192, which
+        # is what Tk's text is really drawn at.
+        self.assertEqual(self.scale("x11", 1.333916849015317, xft=192.0), 2.0)
+        self.assertEqual(self.scale("x11", 1.3339, xft=120.0), 1.25)
+
+    def test_x11_without_xft_dpi_follows_tk(self):
+        self.assertEqual(self.scale("x11", 1.3333), 1.0)
+        # An X server that reports a monitor's real size at 100 percent.
+        self.assertEqual(self.scale("x11", 1.389), 1.0)
+        self.assertEqual(self.scale("x11", 1.2778), 1.0)
+        self.assertEqual(self.scale("x11", 2.6667), 2.0)
+
+    def test_windows_follows_its_dpi(self):
+        self.assertEqual(self.scale("win32", 96 / 72.0), 1.0)
+        self.assertEqual(self.scale("win32", 120 / 72.0), 1.25)
+        self.assertEqual(self.scale("win32", 144 / 72.0), 1.5)
+        self.assertEqual(self.scale("win32", 192 / 72.0), 2.0)
+        # Xft.dpi is an X thing; Windows never reads it.
+        self.assertEqual(self.scale("win32", 96 / 72.0, xft=192.0), 1.0)
+
+    def test_a_retina_mac_is_left_to_the_system(self):
+        for scaling in (1.0, 1.3333, 2.0):
+            self.assertEqual(self.scale("aqua", scaling, xft=192.0), 1.0)
+
+    def test_the_override_wins_and_is_kept_sane(self):
+        env = {self.uiscale.ENV: "1.5"}
+        self.assertEqual(self.scale("x11", 1.3333, xft=192.0, environ=env), 1.5)
+        self.assertEqual(self.scale("aqua", 1.0, environ=env), 1.5)
+        env = {self.uiscale.ENV: "40"}
+        self.assertEqual(self.scale("x11", 1.3333, environ=env), 4.0)
+        env = {self.uiscale.ENV: "big"}
+        self.assertEqual(self.scale("x11", 1.3333, xft=192.0, environ=env), 2.0)
+
+    def test_xft_dpi_is_read_from_the_resources(self):
+        text = ("*customization:\t-color\nXcursor.size:\t48\n"
+                "Xft.antialias:\t1\nXft.dpi:\t192\nXft.hinting:\t1\n")
+        self.assertEqual(self.uiscale.parse_xft_dpi(text), 192.0)
+        self.assertIsNone(self.uiscale.parse_xft_dpi("Xcursor.size:\t48\n"))
+        self.assertIsNone(self.uiscale.parse_xft_dpi(""))
+        self.assertIsNone(self.uiscale.parse_xft_dpi(None))
+
+    def test_reading_xft_dpi_without_an_x_server_is_none(self):
+        self.assertIsNone(self.uiscale.read_xft_dpi(":987654"))
+
+    def test_the_window_grows_but_never_past_the_screen(self):
+        size = self.uiscale.window_size
+        self.assertEqual(size((1280, 800), 1.0, (1280, 800)), (1280, 800))
+        self.assertEqual(size((1280, 800), 2.0, (3456, 1944)), (2560, 1600))
+        width, height = size((1280, 800), 2.0, (2880, 1620))
+        self.assertLessEqual(height, 1620 * 0.9 + 1)
+        self.assertAlmostEqual(width / height, 1.6, places=2)
+        self.assertGreaterEqual(width, 1280)
+        self.assertEqual(size((1280, 800), 2.0, (3456, 1944), fullscreen=True),
+                         (3456, 1944))
+
+    def test_metrics_grow_pixels_and_leave_points_alone(self):
+        from gui.ui import theme
+        one = theme.Metrics(800, 1280)
+        two = theme.Metrics(800, 1280, dpi=2.0)
+        self.assertEqual((two.base, two.small, two.huge),
+                         (one.base, one.small, one.huge))
+        for name in ("row_height", "pad", "gap", "nav_width", "button_height"):
+            self.assertAlmostEqual(getattr(two, name), getattr(one, name) * 2,
+                                   delta=1, msg=name)
+        self.assertEqual(two.px(10), 20)
+        self.assertEqual(one.px(10), 10)
+
+# The settings the Settings screen misread on 2026-09-28: a store, and no
+# Syncthing block at all.
+STORE_SETTINGS = {"store": {"type": "s3", "endpoint": "https://s3.example.net",
+                            "bucket": "saves", "access_key": "a",
+                            "secret_key": "s", "device": "imac"}}
+
+
+class Readiness(unittest.TestCase):
+    def setUp(self):
+        from gui.core import readiness
+        self.readiness = readiness
+
+    def store(self):
+        return settings.Settings(data=json.loads(json.dumps(STORE_SETTINGS)))
+
+    def test_a_store_device_is_named_by_the_store(self):
+        state, ok = self.readiness.device_state(self.store())
+        self.assertEqual((state, ok), ("imac", True))
+        # The running daemon's own name wins: it is the one in use.
+        self.assertEqual(self.readiness.device_state(
+            self.store(), {"device": "imac-2"})[0], "imac-2")
+
+    def test_a_store_is_described_by_its_endpoint_and_uploader(self):
+        conf = self.store()
+        text, ok = self.readiness.sync_state(conf)
+        self.assertIsNone(ok)
+        self.assertIn("s3.example.net", text)
+        self.assertIn("bucket saves", text)
+        text, ok = self.readiness.sync_state(conf, None)
+        self.assertFalse(ok)
+        self.assertIn("not running", text)
+        text, ok = self.readiness.sync_state(conf, {"device": "imac"})
+        self.assertTrue(ok)
+        self.assertNotIn("Syncthing", text)
+
+    def test_a_half_filled_store_says_what_is_missing(self):
+        conf = self.store()
+        conf.data["store"].pop("bucket")
+        text, ok = self.readiness.sync_state(conf, {"device": "x"})
+        self.assertFalse(ok)
+        self.assertIn("bucket", text)
+
+    def test_syncthing_setups_still_read_syncthing(self):
+        conf = settings.Settings(data={"syncthing": {
+            "url": "http://127.0.0.1:8384", "apikey": "k", "folder": "g",
+            "device_dir": "deck", "device_names": {"deck": "Steam Deck"}}})
+        self.assertEqual(self.readiness.device_state(conf),
+                         ("Steam Deck", True))
+        text, ok = self.readiness.sync_state(conf)
+        self.assertTrue(ok)
+        self.assertIn("Syncthing", text)
+        self.assertEqual(self.readiness.device_state(settings.Settings(data={})),
+                         ("not named yet", False))
+        self.assertEqual(self.readiness.check_lines(conf),
+                         ["Sync:         http://127.0.0.1:8384, folder g"])
+
+    def test_the_headline_never_says_all_set_over_a_required_problem(self):
+        class Row(object):
+            def __init__(self, label, ok, required=True):
+                self.label, self.state, self.ok = label, "off", ok
+                self.required = required
+        good = [Row("Engine", True), Row("Steam", False, required=False)]
+        self.assertEqual(self.readiness.headline(good)[1], "good")
+        for broken in ([Row("Engine", True), Row("Store", False)],
+                       [Row("Store", False), Row("Device", False)]):
+            text, kind = self.readiness.headline(broken)
+            self.assertEqual(kind, "warn")
+            self.assertNotIn("Everything", text)
+        text, kind = self.readiness.headline([Row("Store", None)])
+        self.assertEqual(kind, "info")
+        self.assertNotIn("Everything", text)
+
+    def test_check_describes_the_store_not_syncthing(self):
+        lines = self.readiness.check_lines(self.store(), None)
+        text = "\n".join(lines)
+        self.assertNotIn("Sync:", text)
+        self.assertNotIn("apikey", text)
+        self.assertIn("Store:        S3 at s3.example.net, bucket saves", lines)
+        self.assertIn("Device:       imac", lines)
+        self.assertTrue(any(line.startswith("Daemon:       not running")
+                            for line in lines))
+        lines = self.readiness.check_lines(self.store(), {"device": "imac",
+                                                          "queued": []})
+        self.assertTrue(any(line.startswith("Daemon:       running")
+                            for line in lines))
+
+    def test_blockslot_check_prints_the_store(self):
+        """The real --check, end to end, with a store and no daemon."""
+        import contextlib
+        import io
+        folder = Path(tempfile.mkdtemp(prefix="blockslot-check-"))
+        self.addCleanup(shutil.rmtree, str(folder), True)
+        config = folder / "savepick.json"
+        config.write_text(json.dumps(STORE_SETTINGS), encoding="utf-8")
+        (folder / "steam").mkdir()
+        from gui import blockslot
+        self.addCleanup(setattr, storecheck, "daemon_status",
+                        storecheck.daemon_status)
+        storecheck.daemon_status = lambda conf: None
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            blockslot.main(["--check", "--config", str(config),
+                            "--steam-root", str(folder / "steam")])
+        text = out.getvalue()
+        self.assertNotIn("Sync:         not set up", text)
+        self.assertIn("Store:        S3 at s3.example.net", text)
+        self.assertIn("Device:       imac", text)
 
 
 class FakeStore(object):

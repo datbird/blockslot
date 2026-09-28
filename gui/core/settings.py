@@ -36,7 +36,8 @@ STORE_FIELDS = {
     "local": ("root",),
 }
 
-# Written sealed with DPAPI on Windows. Elsewhere the file itself is 0600.
+# Written sealed: with DPAPI on Windows, into the login Keychain on macOS
+# (the file keeps "keychain:<field>"). On Linux the file itself is 0600.
 STORE_SECRETS = ("secret_key", "cf_client_secret")
 
 
@@ -192,18 +193,25 @@ class Settings(object):
         """Merge values into the store section. None or "" removes a key.
 
         A secret is sealed on the way in, so a plain key never reaches the
-        file on Windows. One that is already sealed is left as it is.
+        file on Windows, nor on a Mac whose Keychain is open. One that is
+        already sealed is left as it is.
         """
         block = self.store()
+        slotd = None
         for key, value in values.items():
             if value is None or value == "":
                 block.pop(key, None)
                 continue
-            if key in STORE_SECRETS and not str(value).startswith("dpapi:"):
-                # With the Windows service installed, LocalSystem must be able
-                # to open it too, so it is sealed for the machine.
-                value = engine_module("slotd").protect(
-                    str(value), machine=bool(self.store().get("service")))
+            if key in STORE_SECRETS:
+                slotd = slotd or engine_module("slotd")
+                if not slotd.is_sealed(str(value)):
+                    # With the Windows service installed, LocalSystem must be
+                    # able to open it too, so it is sealed for the machine. On
+                    # a Mac the field names the Keychain item, so saving again
+                    # replaces the key instead of adding a second one.
+                    value = slotd.protect(
+                        str(value), machine=bool(self.store().get("service")),
+                        name=key)
             block[key] = value
         self.data["store"] = block
 
@@ -238,10 +246,15 @@ class Settings(object):
         return block
 
     def store_device(self):
-        """This device's name on the store, as the daemon will use it."""
+        """This device's name on the store, as the daemon will use it.
+
+        The same order slotd.load_settings reads: the store's own name, then
+        the file's, then the Syncthing device folder (tree roots are keyed by
+        it, so a device that moved from Syncthing keeps it), then the host.
+        """
         import socket
         return self.store().get("device") or self.data.get("device") \
-            or socket.gethostname()
+            or self.sync.get("device_dir") or socket.gethostname()
 
     # ------------------------------------------------------------ trees
 

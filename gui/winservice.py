@@ -215,13 +215,18 @@ class Host(object):
     Also waits, instead of exiting, when another daemon already answers on
     the shared queue (a picker's own worker, say), because a service that
     exits is one the service manager keeps restarting.
+
+    The Mac's LaunchAgent runs the same host (gui/launchagent.py), with its
+    own log and its own queue folder in place of ProgramData's.
     """
 
-    def __init__(self, config, slotd_module):
+    def __init__(self, config, slotd_module, say=None, default_state=None):
         self.config = config
         self.slotd = slotd_module
         self.stop_event = threading.Event()
         self.daemon = None
+        self.log = say or log
+        self.default_state = default_state or shared_state_dir
 
     def _mtime(self):
         try:
@@ -232,21 +237,28 @@ class Host(object):
     def run(self):
         slotd = self.slotd
         while not self.stop_event.is_set():
-            settings, device = slotd.load_settings(self.config)
-            if not settings:
-                log("no store in %s; checking again in %ds" % (self.config, RETRY_SECONDS))
+            try:
+                settings, device = slotd.load_settings(self.config)
+            except slotd.ss.StoreError as exc:
+                # A secret that cannot be opened (a locked Keychain, one
+                # sealed for another user) is waited out, not crashed on.
+                self.log("the store secret cannot be opened: %s" % exc)
                 self.stop_event.wait(RETRY_SECONDS)
                 continue
-            state = settings.get("state_dir") or str(shared_state_dir())
+            if not settings:
+                self.log("no store in %s; checking again in %ds" % (self.config, RETRY_SECONDS))
+                self.stop_event.wait(RETRY_SECONDS)
+                continue
+            state = settings.get("state_dir") or str(self.default_state())
             if slotd._client_from_info(state):
-                log("another daemon answers on %s; waiting" % state)
+                self.log("another daemon answers on %s; waiting" % state)
                 self.stop_event.wait(RETRY_SECONDS)
                 continue
             try:
                 daemon = slotd.daemon_from_settings(settings, device, state,
                                                     str(self.config))
             except Exception as exc:
-                log("the store settings are wrong: %s" % exc)
+                self.log("the store settings are wrong: %s" % exc)
                 self.stop_event.wait(RETRY_SECONDS)
                 continue
             self.daemon = daemon
@@ -254,11 +266,11 @@ class Host(object):
             server = threading.Thread(target=slotd.serve, args=(daemon, state),
                                       name="slotd", daemon=True)
             server.start()
-            log("serving %s for %s" % (daemon.store_label, device))
+            self.log("serving %s for %s" % (daemon.store_label, device))
             while not self.stop_event.is_set() and server.is_alive():
                 self.stop_event.wait(RELOAD_POLL)
                 if self._mtime() != seen:
-                    log("settings changed; reloading")
+                    self.log("settings changed; reloading")
                     break
             daemon.paused = True
             if daemon.lock.acquire(timeout=15):
@@ -266,7 +278,7 @@ class Host(object):
             daemon.shutdown()
             server.join(10)
             self.daemon = None
-        log("stopped")
+        self.log("stopped")
 
     def stop(self):
         self.stop_event.set()

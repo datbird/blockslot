@@ -56,14 +56,39 @@ PAUSED_MESSAGE = ("uploads are paused on this device. Resume them from the "
 # ------------------------------------------------------------------ places
 
 
+def real_home():
+    """The person's home, also when snap Steam started the picker.
+
+    Inside the Steam snap HOME is ~/snap/steam/common and the XDG variables
+    point in there too; snapd keeps the real home in SNAP_REAL_HOME. The
+    queue, daemon.json and savepick.json are one per person, so a picker in
+    the snap and a daemon outside it must name the same ones.
+    """
+    if _in_snap():
+        return os.environ["SNAP_REAL_HOME"]
+    return os.path.expanduser("~")
+
+
+def _in_snap():
+    return bool(os.environ.get("SNAP_NAME") and os.environ.get("SNAP_REAL_HOME"))
+
+
+def _xdg(variable, default):
+    value = os.environ.get(variable)
+    if value and not _in_snap():
+        return value
+    return os.path.join(real_home(), default)
+
+
 def default_state_dir():
     if sys.platform == "win32":
         base = os.environ.get("LOCALAPPDATA") or os.path.expanduser("~")
         return os.path.join(base, "Blockslot", "store")
     if sys.platform == "darwin":
-        return os.path.expanduser("~/Library/Application Support/Blockslot/store")
-    base = os.environ.get("XDG_STATE_HOME") or os.path.expanduser("~/.local/state")
-    return os.path.join(base, "blockslot", "store")
+        return os.path.join(real_home(), "Library", "Application Support",
+                            "Blockslot", "store")
+    return os.path.join(_xdg("XDG_STATE_HOME", os.path.join(".local", "state")),
+                        "blockslot", "store")
 
 
 def default_config_path():
@@ -71,7 +96,19 @@ def default_config_path():
     if sys.platform == "win32":
         base = os.environ.get("APPDATA") or os.path.expanduser("~")
         return os.path.join(base, "savepick.json")
-    return os.path.join(os.path.expanduser("~"), ".config", "savepick.json")
+    return os.path.join(real_home(), ".config", "savepick.json")
+
+
+# The systemd user unit `blockslot.py --install-service` writes on Linux
+# (gui/core/userservice.py). The picker starts the daemon through it when it
+# is there, so the daemon runs in the person's own session and not inside
+# whatever sandbox started the game.
+SYSTEMD_UNIT = "blockslot.service"
+
+
+def systemd_unit_path():
+    return os.path.join(_xdg("XDG_CONFIG_HOME", ".config"), "systemd", "user",
+                        SYSTEMD_UNIT)
 
 
 def load_settings(path=None):
@@ -87,7 +124,7 @@ def load_settings(path=None):
         return None, None
     store = dict(store)
     for field in ("secret_key", "cf_client_secret"):
-        if isinstance(store.get(field), str) and store[field].startswith("dpapi:"):
+        if isinstance(store.get(field), str) and is_sealed(store[field]):
             store[field] = unprotect(store[field])
     # The Syncthing device directory is the name tree roots are keyed by, so
     # a device keeps it on the store unless it is given another.
@@ -99,26 +136,115 @@ def load_settings(path=None):
 # ------------------------------------------------------------------ secrets
 
 
-def protect(text, machine=False):
-    """Encrypt a secret for this Windows user. Plain text elsewhere, where
-    the settings file is mode 0600 instead.
+KEYCHAIN = "keychain:"
+KEYCHAIN_SERVICE = "BlockSlot"
+SECURITY = "/usr/bin/security"
 
-    `machine` seals it for this PC instead of this user, so the Blockslot
-    service (LocalSystem) can open it as well as the user can.
+
+def is_sealed(text):
+    """True when a stored secret is a reference to a sealed one, not the key."""
+    return isinstance(text, str) and (text.startswith("dpapi:")
+                                      or text.startswith(KEYCHAIN))
+
+
+def protect(text, machine=False, name=None, platform=None, runner=None):
+    """Seal a secret for this user. What the settings file holds instead.
+
+    Windows: encrypted with DPAPI for this user. `machine` seals it for this
+    PC instead, so the Blockslot service (LocalSystem) can open it as well as
+    the user can.
+
+    macOS: put in the login Keychain under service "BlockSlot" and account
+    `name` (the settings field), and the file holds only "keychain:<name>".
+    When the Keychain will not take it (locked, or no login session, as over
+    ssh), the key stays in the file, which is mode 0600 there as on Linux.
+
+    Elsewhere: plain text, in a settings file that is mode 0600.
     """
-    if sys.platform != "win32":
+    platform = platform or sys.platform
+    if platform == "darwin":
+        return _keychain_protect(text, name, runner)
+    if platform != "win32":
         return text
     blob = _dpapi(text.encode("utf-8"), encrypt=True, machine=machine)
     return "dpapi:" + base64.b64encode(blob).decode("ascii")
 
 
-def unprotect(text):
+def unprotect(text, platform=None, runner=None):
+    platform = platform or sys.platform
+    if text.startswith(KEYCHAIN):
+        if platform != "darwin":
+            raise ss.StoreRefused("this secret is in a Mac's Keychain and "
+                                  "cannot be read here")
+        found = _keychain_read(text[len(KEYCHAIN):], runner)
+        if found is None:
+            raise ss.StoreRefused(
+                "the macOS Keychain did not give BlockSlot the store's secret. "
+                "Unlock the login keychain, or type the secret again.")
+        return found
     if not text.startswith("dpapi:"):
         return text
-    if sys.platform != "win32":
+    if platform != "win32":
         raise ss.StoreRefused("this secret was encrypted on Windows and cannot "
                               "be read here")
     return _dpapi(base64.b64decode(text[6:]), encrypt=False).decode("utf-8")
+
+
+# The Keychain is reached through /usr/bin/security, the one tool every Mac
+# has. Its `add-generic-password -w SECRET` would put the key on a command
+# line, where `ps` shows it to every user on the machine for as long as the
+# call runs. `security -i` reads its commands from stdin instead, so the key
+# only ever travels through a pipe. Reading it back (`find-generic-password
+# -w`) prints it to stdout, which is a pipe too. The Keychain lets security
+# read an item that security itself wrote without asking anyone, which is
+# what lets the LaunchAgent open it at login.
+
+
+def _security(args, stdin=None, runner=None):
+    """(exit code, stdout). Never raises: a Mac without a Keychain is a
+    Mac that keeps its secret in the file."""
+    run = runner or subprocess.run
+    try:
+        done = run([SECURITY] + list(args), input=stdin, capture_output=True,
+                   text=True, timeout=20)
+    except (OSError, subprocess.SubprocessError):
+        return None, ""
+    return done.returncode, done.stdout or ""
+
+
+def _security_quote(text):
+    """One argument for `security -i`, which splits its lines like a shell:
+    inside double quotes, a backslash escapes the next character."""
+    return '"%s"' % text.replace("\\", "\\\\").replace('"', '\\"')
+
+
+def _keychain_protect(text, name, runner=None):
+    if runner is None and os.environ.get("BLOCKSLOT_NO_KEYCHAIN"):
+        # Set by the test suites, so a test run on a Mac never writes over
+        # the Keychain item a real BlockSlot on it is using.
+        return text
+    if any(char in text for char in "\r\n\0"):
+        # One command per line on stdin: a key with a line break in it cannot
+        # be passed whole, and a key that is not whole is worse than none.
+        return text
+    account = name or "secret-" + secrets.token_hex(6)
+    line = "add-generic-password -U -s %s -a %s -l %s -w %s\n" % (
+        _security_quote(KEYCHAIN_SERVICE), _security_quote(account),
+        _security_quote("BlockSlot store secret"), _security_quote(text))
+    _security(["-i"], stdin=line, runner=runner)
+    # `security -i` does not always say that one of its commands failed, so
+    # the only proof the Keychain holds the key is reading it back.
+    if _keychain_read(account, runner) != text:
+        return text
+    return KEYCHAIN + account
+
+
+def _keychain_read(account, runner=None):
+    code, out = _security(["find-generic-password", "-s", KEYCHAIN_SERVICE,
+                           "-a", account, "-w"], runner=runner)
+    if code != 0:
+        return None
+    return out[:-1] if out.endswith("\n") else out
 
 
 def _dpapi(data, encrypt, machine=False):
@@ -313,7 +439,7 @@ def _describe(view, snap_id):
     played = manifest.get("played") or {}
     return {"id": snap_id, "device": manifest.get("device") or ss.snap_device(snap_id),
             "created": manifest.get("created"), "played_end": played.get("end"),
-            "played_start": played.get("start"),
+            "played_start": played.get("start"), "os": ss.manifest_family(manifest),
             "bytes": sum(r.get("size", 0) for r in manifest.get("files") or [])}
 
 
@@ -346,6 +472,7 @@ class Daemon(object):
         for snap_id in self.state.queued():
             manifest = self.state.queued_manifest(snap_id) or {}
             queued.append({"id": snap_id, "game": manifest.get("game"),
+                           "os": ss.manifest_family(manifest),
                            "bytes": sum(r.get("size", 0) for r in manifest.get("files") or []),
                            "progress": self.progress.get(snap_id)})
         error = None
@@ -353,39 +480,63 @@ class Daemon(object):
             error = {"kind": self.last_error[0], "message": self.last_error[1],
                      "at": self.last_error[2]}
         return {"device": self.device, "store": self.store_label, "queued": queued,
-                "error": error, "last_ok": self.last_ok, "paused": self.paused}
+                "os": ss.host_family(), "error": error, "last_ok": self.last_ok,
+                "paused": self.paused}
 
-    def decide(self, game, local_hashes):
+    def family_for(self, game, view, os_family=None):
+        """The OS family this device plays a game as.
+
+        The picker says, because it knows which build it launched (a Proton
+        game is Windows). Asked from the tray or the panel, the device's own
+        history of the game says, and failing that, this machine's OS.
+        """
+        return (os_family or ss.device_family(view, self.device, self.state.base(game))
+                or ss.host_family())
+
+    def decide(self, game, local_hashes, os_family=None):
         """The launch decision for this game, with what the picker needs to
-        say it. Never raises: an unreachable store is UNKNOWN."""
+        say it. Never raises: an unreachable store is UNKNOWN.
+
+        Only the history of this device's OS family counts: a newer save
+        made for another OS is neither restored nor asked about.
+        """
         base = self.state.base(game)
         queued = self.state.queued(game)
         try:
-            view = ss.read_game(self.store, game, cache_dir=self.state.cache_dir)
+            whole = ss.read_game(self.store, game, cache_dir=self.state.cache_dir)
         except ss.StoreError as exc:
             self._note_error(exc)
             return {"action": ss.UNKNOWN, "reachable": False,
                     "error": str(exc), "base": base, "queued": queued}
         self._note_ok()
+        family = self.family_for(game, whole, os_family)
+        view = ss.family_view(whole, family)
+        if base is not None and base in whole.manifests and base not in view.manifests:
+            base_here = None
+        else:
+            base_here = base
         if queued:
             # This device has saves the store has not seen. They are newer than
             # anything it knows of here, so the local save stands.
             action, detail = ss.LAUNCH, None
-            if len(view.heads) > 1 or (view.heads and base and
-                                       not view.descends_from(view.heads[-1], base)
-                                       and view.heads[-1] != base):
+            if len(view.heads) > 1 or (view.heads and base_here and
+                                       not view.descends_from(view.heads[-1], base_here)
+                                       and view.heads[-1] != base_here):
                 action, detail = ss.ASK, view.heads
         else:
-            action, detail = ss.decide(view, base, set(local_hashes or []), self.device)
+            action, detail = ss.decide(view, base, set(local_hashes or []), self.device,
+                                       family=family)
             pending = self.state.restore_pending(game)
             heads = view.heads
-            if (pending and action == ss.LAUNCH and len(heads) == 1
+            if (pending and pending in view.manifests and action == ss.LAUNCH
+                    and len(heads) == 1
                     and set(local_hashes or []) != ss.save_hashes(view.manifests[heads[0]])):
                 # A choice made from the tray or the panel, not yet on this
                 # device. Restore it now.
                 action, detail = ss.RESTORE, heads[0]
         answer = {"action": action, "reachable": True, "base": base,
-                  "queued": queued, "heads": [_describe(view, h) for h in view.heads]}
+                  "queued": queued, "os": family,
+                  "heads": [_describe(view, h) for h in view.heads]}
         if action == ss.RESTORE:
             answer["restore"] = _describe(view, detail)
         elif action == ss.ASK:
@@ -489,9 +640,9 @@ class Daemon(object):
         written, failed = ss.fetch_blobs(self.store, items)
         return {"written": written, "failed": failed}
 
-    def stage(self, game, source, played=None, mode="game", unit=None):
+    def stage(self, game, source, played=None, mode="game", unit=None, os_family=None):
         manifest = self.state.stage(game, self.device, source, played=played, mode=mode,
-                                    unit=unit)
+                                    unit=unit, os_family=os_family)
         self.kick.set()
         return {"snap": manifest["id"], "parents": manifest["parents"]}
 
@@ -504,11 +655,21 @@ class Daemon(object):
 
     def choose(self, game, snap_id):
         """A person picked one head of a fork. Record it on the store with no
-        upload: a merge snapshot of the chosen files, naming every head."""
-        view = ss.read_game(self.store, game, cache_dir=self.state.cache_dir)
-        heads = view.heads
-        if snap_id not in view.manifests:
+        upload: a merge snapshot of the chosen files, naming every head of
+        that save's OS family (a fork is only ever within one family)."""
+        whole = ss.read_game(self.store, game, cache_dir=self.state.cache_dir)
+        if snap_id not in whole.manifests:
             raise ss.NotFound(snap_id)
+        family = ss.manifest_family(whole.manifests[snap_id])
+        mine = ss.device_family(whole, self.device, self.state.base(game))
+        if family != ss.ANY and mine and mine != family:
+            # This device would restore it at its next launch, into paths
+            # the other OS's build of the game does not use.
+            raise ss.StoreRefused(
+                "that save was made for %s, and this device plays the %s version "
+                "of %s" % (ss.family_name(family), ss.family_name(mine), game))
+        view = ss.family_view(whole, family)
+        heads = view.heads
         self.state.set_base(game, snap_id,
                             merge=[h for h in heads if h != snap_id])
         # Chosen from the tray or the Deck panel, the save on this device may
@@ -737,7 +898,8 @@ class _Handler(http.server.BaseHTTPRequestHandler):
             if route == ("GET", "/status"):
                 return self._reply(200, d.status())
             if route == ("POST", "/decide"):
-                return self._reply(200, d.decide(body["game"], body.get("hashes") or []))
+                return self._reply(200, d.decide(body["game"], body.get("hashes") or [],
+                                                 os_family=body.get("os")))
             if route == ("POST", "/tree"):
                 return self._reply(200, d.tree(body["game"]))
             if route == ("POST", "/library_list"):
@@ -752,7 +914,8 @@ class _Handler(http.server.BaseHTTPRequestHandler):
                 return self._reply(200, d.stage(body["game"], body["source"],
                                                 played=body.get("played"),
                                                 mode=body.get("mode") or "game",
-                                                unit=body.get("unit")))
+                                                unit=body.get("unit"),
+                                                os_family=body.get("os")))
             if route == ("GET", "/wait"):
                 return self._reply(200, d.wait(query["snap"],
                                                float(query.get("timeout") or 0)))
@@ -875,9 +1038,9 @@ class Client(object):
         self.store_label = answer.get("store")
         return answer
 
-    def decide(self, game, local_hashes):
-        return self._call("POST", "/decide", {"game": game, "hashes": sorted(local_hashes or [])},
-                          timeout=60)
+    def decide(self, game, local_hashes, os_family=None):
+        return self._call("POST", "/decide", {"game": game, "hashes": sorted(local_hashes or []),
+                                              "os": os_family}, timeout=60)
 
     def tree(self, game):
         return self._call("POST", "/tree", {"game": game}, timeout=120)
@@ -905,10 +1068,10 @@ class Client(object):
         return self._call("POST", "/fetch", {"game": game, "snap": snap_id, "into": into},
                           timeout=600)
 
-    def stage(self, game, source, played=None, mode="game", unit=None):
+    def stage(self, game, source, played=None, mode="game", unit=None, os_family=None):
         return self._call("POST", "/stage", {"game": game, "source": source,
                                              "played": played, "mode": mode,
-                                             "unit": unit}, timeout=300)
+                                             "unit": unit, "os": os_family}, timeout=300)
 
     def wait(self, snap_id, timeout):
         return self._call("GET", "/wait?snap=%s&timeout=%s"
@@ -949,8 +1112,25 @@ def _client_from_info(state_dir):
         return None
 
 
-def start_detached(config_path=None):
-    """Start `slotd.py --serve` with no window and no tie to this process."""
+def start_detached(config_path=None, runner=None):
+    """Start `slotd.py --serve` with no window and no tie to this process.
+
+    On Linux with the user unit installed, systemd starts it instead. A
+    daemon forked from a game started by snap Steam would otherwise live in
+    the snap's sandbox and its cgroup, with a private /tmp, and stop with
+    Steam.
+    """
+    if (sys.platform.startswith("linux") and not getattr(sys, "frozen", False)
+            and os.path.isfile(systemd_unit_path())):
+        run = runner or subprocess.run
+        try:
+            done = run(["systemctl", "--user", "--no-block", "start", SYSTEMD_UNIT],
+                       stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                       stderr=subprocess.DEVNULL, timeout=10)
+            if done.returncode == 0:
+                return True
+        except (OSError, subprocess.SubprocessError):
+            pass
     if getattr(sys, "frozen", False):
         # Inside Blockslot.exe: the exe is the daemon host, with its tray.
         argv = [sys.executable, "--daemon"]

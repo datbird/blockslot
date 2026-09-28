@@ -13,6 +13,14 @@ It becomes the only head, so each device restores it at its next launch
 through the ordinary lineage rule (the head descends from the device's base).
 The blobs are already on the store, so nothing but a small manifest is
 written; slotstore.commit proves each blob is still there first.
+
+ONE HISTORY PER OPERATING SYSTEM
+
+Each OS family (Windows, Linux, macOS) keeps its own history of a game; see
+"operating systems" in slotstore. Heads, forks and restores are all worked
+out within one family. Restoring a Mac save makes it the Mac's current save
+and names only the Mac's heads as parents, so a Linux or Windows device
+never restores it: the server cannot offer a restore across OSes.
 """
 
 import concurrent.futures
@@ -156,16 +164,18 @@ class Catalog(object):
                 continue
             manifests = {sid: self.manifests[sid] for sid in entry["snapshots"]}
             view = ss.GameView(game_dir, manifests, {})
-            head = view.newest_head()
-            if head is None:
+            systems = family_summary(view)
+            if not systems:
                 continue
+            newest = max(systems, key=lambda row: row["when"] or "")
+            head = newest["head"]
             row = describe_game(game_dir, manifests[head])
-            played = manifests[head].get("played") or {}
             pending = [sid for sid in entry["pending"] if sid not in manifests]
             row.update({
-                "when": played.get("end") or manifests[head].get("created"),
-                "device": manifests[head].get("device") or ss.snap_device(head),
-                "heads": len(view.heads), "snapshots": len(manifests),
+                "when": newest["when"], "device": newest["device"],
+                # Two saves only ever means two within one OS's history.
+                "heads": max(system["heads"] for system in systems),
+                "systems": systems, "snapshots": len(manifests),
                 "uploading": len(pending)})
             rows.append(row)
         rows.sort(key=lambda row: row.get("when") or "", reverse=True)
@@ -186,20 +196,64 @@ def describe_game(game_dir, manifest):
             "library": None, "system": "", "label": None}
 
 
+def family_heads(view):
+    """{family: [head ids]}, one entry per OS history the game has."""
+    return {family: part.heads for family, part in ss.view_families(view)}
+
+
+def all_heads(view):
+    """Every snapshot that is current in at least one OS history."""
+    out = set()
+    for heads in family_heads(view).values():
+        out.update(heads)
+    return sorted(out, key=view.sort_time)
+
+
+def family_summary(view):
+    """[{os, head, when, device, heads}] for each OS history, newest head each."""
+    rows = []
+    for family, part in ss.view_families(view):
+        head = part.newest_head()
+        if head is None:
+            continue
+        manifest = part.manifests[head]
+        played = manifest.get("played") or {}
+        rows.append({"os": family, "head": head,
+                     "when": played.get("end") or manifest.get("created"),
+                     "device": manifest.get("device") or ss.snap_device(head),
+                     "heads": len(part.heads)})
+    return rows
+
+
 def history(view):
-    """Every snapshot of a game, newest first, as the game page shows it."""
-    heads = set(view.heads)
+    """Every snapshot of a game, newest first, as the game page shows it.
+
+    Each row says its OS family ("os"), whether it is current in its OS's
+    history ("head"), and how many current saves that history has
+    ("family_heads"; two or more is a fork to settle)."""
+    by_family = family_heads(view)
     rows = []
     for snap_id, manifest in view.manifests.items():
         played = manifest.get("played") or {}
+        family = ss.manifest_family(manifest)
+        if family == ss.ANY:
+            # Shared by every history: current if any history has it current.
+            holding = [heads for heads in by_family.values() if snap_id in heads]
+            is_head = bool(holding)
+            count = max([len(heads) for heads in holding] or [0])
+        else:
+            is_head = snap_id in by_family.get(family, [])
+            count = len(by_family.get(family, []))
         rows.append({
             "id": snap_id,
+            "os": family,
+            "family_heads": count,
             "device": manifest.get("device") or ss.snap_device(snap_id),
             "created": manifest.get("created"),
             "played_start": played.get("start"), "played_end": played.get("end"),
             "bytes": sum(r.get("size", 0) for r in manifest.get("files") or []),
             "files": len(manifest.get("files") or []),
-            "head": snap_id in heads,
+            "head": is_head,
             "merge": bool(manifest.get("merge_only")),
             "restored_from": manifest.get("restored_from"),
             "imported": bool(manifest.get("imported")),
@@ -219,25 +273,35 @@ def restore(store, view, snap_id, settle=False, now=None):
 
     settle=True is "Settle two saves": snap_id must be one of the heads of a
     game that has more than one. Returns the new manifest.
+
+    Everything happens within the chosen save's OS history: its heads are
+    the parents, and the new snapshot carries its OS, so no device of
+    another OS restores it.
     """
     if view is None:
         raise SavesError("That game is not on the store.")
     chosen = view.manifests.get(snap_id)
     if chosen is None:
         raise SavesError("That save is not on the store any more.")
-    heads = view.heads
+    family = ss.manifest_family(chosen)
+    if family == ss.ANY:
+        heads = all_heads(view)
+    else:
+        heads = ss.family_view(view, family).heads
+    where = "" if family == ss.ANY else " %s" % ss.family_name(family)
     if settle:
         if len(heads) < 2:
-            raise SavesError("This game has one save; there is nothing to settle.")
+            raise SavesError("This game has one%s save; there is nothing to settle." % where)
         if snap_id not in heads:
-            raise SavesError("Pick one of the two newest saves.")
+            raise SavesError("Pick one of the two newest%s saves." % where)
     elif heads == [snap_id]:
-        raise SavesError("That is already the current save.")
+        raise SavesError("That is already the current%s save." % where)
     if ss.game_key(chosen["game"]) != view.game:
         raise SavesError("That save names a different game; it cannot be restored here.")
     manifest = ss.make_manifest(chosen["game"], SERVER_DEVICE, list(chosen["files"]),
                                 heads, played=chosen.get("played"),
-                                mode=chosen.get("mode") or "game", created=now)
+                                mode=chosen.get("mode") or "game", created=now,
+                                os_family=None if family == ss.ANY else family)
     manifest["merge_only"] = True
     manifest["restored_from"] = snap_id
     if chosen.get("unit"):

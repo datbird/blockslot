@@ -6,6 +6,10 @@
     python3 gui/blockslot.py --fullscreen    for Game Mode
     python3 gui/blockslot.py --daemon        the store daemon (a tray icon
                                              on Windows), started at login
+    python3 gui/blockslot.py --install-service
+                                             the daemon as a Windows service
+                                             (admin), a systemd user unit
+                                             (Linux) or a LaunchAgent (macOS)
     Blockslot.exe --pick [switches] -- CMD   the engine, as a launch option
                                              runs it (savepick.py's switches)
 
@@ -22,7 +26,7 @@ HERE = Path(__file__).resolve().parent
 if str(HERE.parent) not in sys.path:
     sys.path.insert(0, str(HERE.parent))
 
-from gui.core import engine, launchopts, model, paths  # noqa: E402
+from gui.core import engine, launchopts, model, paths, readiness  # noqa: E402
 from gui.core import settings as settings_mod, shortcuts, steamdir  # noqa: E402
 
 
@@ -114,14 +118,22 @@ class Controller(object):
             % (counts["total"], counts["wrapped"], counts["cloud"]),
             "Candidates:   %d" % counts["candidates"],
         ]
-        missing = self.settings.missing_sync_keys()
-        if missing:
-            lines.append("Sync:         not set up (%s)" % ", ".join(missing))
-        else:
-            lines.append("Sync:         %s, folder %s"
-                         % (self.settings.sync.get("url"),
-                            self.settings.sync.get("folder")))
+        if paths.is_linux():
+            if library.root:
+                lines.insert(1, "Install:      %s" % steamdir.install_kind(library.root))
+            lines.append(_unit_line(self.settings.path))
+        lines.extend(readiness.check_lines(self.settings, self.daemon_status()))
         return lines
+
+    def daemon_status(self):
+        """The store daemon's answer, or None. Not asked without a store."""
+        if not readiness.using_store(self.settings):
+            return None
+        from gui.core import storecheck
+        try:
+            return storecheck.daemon_status(self.settings)
+        except Exception:
+            return None
 
 
 def _engine_line():
@@ -133,6 +145,16 @@ def _engine_line():
     return "Engine:       %s%s" % (paths.engine_path(),
                                    "" if paths.engine_path().is_file()
                                    else "   (not installed)")
+
+
+def _unit_line(config):
+    from gui.core import userservice
+    if not userservice.is_installed():
+        return "Daemon unit:  not installed (--install-service)"
+    if not userservice.is_current(config):
+        return "Daemon unit:  %s names another copy; run --install-service" % (
+            userservice.unit_path())
+    return "Daemon unit:  %s" % userservice.unit_path()
 
 
 def attach_console():
@@ -201,11 +223,36 @@ def run_gui(controller, fullscreen=False, size=(1280, 800)):
     return 0
 
 
+def run_linux_service_command(args):
+    """--install-service and --uninstall-service on Linux: a systemd user
+    unit, which needs no root (gui/core/userservice.py)."""
+    from gui.core import userservice
+    try:
+        if args.install_service:
+            lines = userservice.install(args.config)
+        else:
+            lines = userservice.uninstall()
+    except (RuntimeError, OSError) as exc:
+        print("Stopped: %s" % exc, file=sys.stderr)
+        return 1
+    for line in lines:
+        print(line)
+    return 0
+
+
 def run_service_command(args):
-    """--service, --install-service, --uninstall-service."""
+    """--service, --install-service, --uninstall-service.
+
+    A Windows service on Windows, a systemd user unit on Linux
+    (gui/core/userservice.py), a LaunchAgent on a Mac (gui/launchagent.py).
+    """
+    if not paths.is_windows() and not paths.is_mac() and not args.service:
+        return run_linux_service_command(args)
     from gui import tray, winservice
     slotd = tray.load_slotd()
     config = args.config or slotd.default_config_path()
+    if paths.is_mac():
+        return run_agent_command(args, config, slotd)
     if args.service:
         return winservice.run_as_service(config, slotd)
     attach_console()
@@ -220,6 +267,24 @@ def run_service_command(args):
             from gui.core import autostart
             autostart.enable()
             lines.append("Login starts the plain daemon again")
+    except (RuntimeError, OSError) as exc:
+        print("Stopped: %s" % exc, file=sys.stderr)
+        return 1
+    for line in lines:
+        print(line)
+    return 0
+
+
+def run_agent_command(args, config, slotd):
+    """The Mac's side of run_service_command: launchd holds the daemon."""
+    from gui import launchagent
+    if args.service:
+        return launchagent.run(config, slotd)
+    try:
+        if args.install_service:
+            lines = launchagent.install(config, slotd_module=slotd)
+        else:
+            lines = launchagent.uninstall(config)
     except (RuntimeError, OSError) as exc:
         print("Stopped: %s" % exc, file=sys.stderr)
         return 1
@@ -250,7 +315,8 @@ def load_savepick():
 def run_pick(argv):
     """`Blockslot.exe --pick [switches] -- <game>`: savepick, in this process.
 
-    This is what a launch option runs on a Windows PC with no python. It is
+    This is what a launch option runs on a Windows PC with no python, and
+    on a Mac from the built app (Blockslot.app/Contents/MacOS/Blockslot). It is
     the same as `pythonw savepick.py [switches] -- <game>`: savepick.main is
     handed everything after --pick, the same list it gets from sys.argv[1:]
     when run as a file, and its answer is the exit code. The build has no
@@ -277,11 +343,15 @@ def main(argv=None):
     parser.add_argument("--tray", action="store_true",
                         help="the tray icon for the BlockSlot service (Windows)")
     parser.add_argument("--service", action="store_true",
-                        help="run as the Windows service (the service manager starts this)")
+                        help="run as the Windows service or the macOS LaunchAgent "
+                             "(the service manager or launchd starts this)")
     parser.add_argument("--install-service", action="store_true",
-                        help="install and start the Windows service (admin)")
+                        help="install and start the daemon as the Windows "
+                             "service (admin), a systemd user unit on Linux, "
+                             "or the LaunchAgent on macOS")
     parser.add_argument("--uninstall-service", action="store_true",
-                        help="stop and remove the Windows service (admin)")
+                        help="stop and remove the Windows service (admin), the "
+                             "systemd user unit, or the LaunchAgent on macOS")
     parser.add_argument("--steam-root", help="read this Steam folder instead")
     parser.add_argument("--user", type=int, help="Steam3 account id to use")
     parser.add_argument("--config", help="savepick.json to read and write")

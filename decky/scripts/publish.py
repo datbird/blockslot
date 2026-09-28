@@ -11,8 +11,14 @@ committed to the plugin's own repository.
 
 It copies a fixed list and nothing else. A file is published because it is
 named here, never because it happened to be lying in decky/.
+
+Then it scans what it wrote for the owner's own names with the scan of
+tools/publish_public.py, and fails if it finds one. That script (and so its
+list of names) is kept out of the public repo; a copy without it says so and
+publishes unscanned.
 """
 
+import importlib.util
 import shutil
 import subprocess
 import sys
@@ -29,6 +35,20 @@ DIRECTORIES = ("src", "py_modules", "defaults")
 ASSETS = (("assets/blockslot.png", "assets/blockslot.png"),)
 
 IGNORE = "node_modules/\ndist/\nout/\n__pycache__/\n*.pyc\n"
+PRIVACY = ROOT / "tools" / "publish_public.py"
+# The game index is public data: real titles, scanned for network and
+# account names only.
+DATA_FILES = ("defaults/index/games.json",)
+
+
+def privacy_scan(out):
+    """[(file, what matched)], or None when there is no list to scan with."""
+    if not PRIVACY.is_file():
+        return None
+    spec = importlib.util.spec_from_file_location("publish_public", str(PRIVACY))
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module.scan(out, DATA_FILES)
 
 
 def main():
@@ -63,7 +83,17 @@ def main():
 
     count = sum(1 for item in out.rglob("*")
                 if item.is_file() and ".git" not in item.parts)
-    print("published %d files to %s" % (count, out))
+    found = privacy_scan(out)
+    if found is None:
+        print("note: no %s here, so no privacy scan" % PRIVACY.relative_to(ROOT),
+              file=sys.stderr)
+    elif found:
+        for name, text in found:
+            print("PRIVATE %s: %s" % (name, text), file=sys.stderr)
+        print("refusing: the tree above names private things", file=sys.stderr)
+        return 1
+    print("published %d files to %s%s" % (count, out,
+                                          ", privacy scan clean" if found == [] else ""))
     return 0
 
 

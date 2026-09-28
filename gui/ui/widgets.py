@@ -108,7 +108,11 @@ class Button(tk.Canvas):
         self.redraw()
 
     def _natural_width(self, text):
-        return max(int(self.metrics.base * 0.72 * len(text)) + self.metrics.pad * 3,
+        # The old estimate, grown with the display, and the measured text:
+        # whichever is wider, so a label is never clipped at any scale.
+        guess = int(self.metrics.px(self.metrics.base * 0.72 * len(text)))
+        measured = width_of(text, self.metrics.font(bold=True))
+        return max(max(guess, measured) + self.metrics.pad * 3,
                    int(120 * self.metrics.scale))
 
     def configure_text(self, text):

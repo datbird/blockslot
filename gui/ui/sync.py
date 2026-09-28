@@ -107,11 +107,15 @@ class SyncScreen(app_mod.Screen):
                            self.metrics.pad + dot, middle + dot / 2,
                            fill=colour, outline="")
         left = self.metrics.pad * 2.4
-        canvas.create_text(left, middle - self.metrics.small * 0.85, anchor="w",
+        canvas.create_text(left,
+                           middle - self.metrics.px(self.metrics.small * 0.85),
+                           anchor="w",
                            text=row.label, fill=theme.TEXT,
                            font=self.metrics.font(bold=True))
         spec = self.metrics.font("small")
-        canvas.create_text(left, middle + self.metrics.small * 0.95, anchor="w",
+        canvas.create_text(left,
+                           middle + self.metrics.px(self.metrics.small * 0.95),
+                           anchor="w",
                            text=widgets.elide(row.detail or "", spec,
                                               width - left - self.metrics.pad,
                                               keep="start"),
@@ -149,12 +153,9 @@ class SyncScreen(app_mod.Screen):
 
     def _test_worker(self, config):
         steps = syncthing.check(config)
-        try:
-            self.app.after(0, self._show_checks, steps)
-        except RuntimeError:
-            # The window closed while Syncthing was still answering. Nothing
-            # to show the answer in.
-            pass
+        # Never Tk from a worker. If the window closed while Syncthing was
+        # still answering, nobody collects the answer.
+        self.app.post(self._show_checks, steps)
 
     def _show_checks(self, steps):
         rows = [Check(label, ok, detail) for label, ok, detail in steps]

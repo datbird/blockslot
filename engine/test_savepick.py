@@ -2,11 +2,14 @@
 import contextlib
 import json
 import os
+import plistlib
 import shutil
 import time
 import unittest
+from unittest import mock
 from pathlib import Path
 import struct
+import sys
 import tempfile
 
 import savepick
@@ -3048,18 +3051,18 @@ class TestPeerTreeIndex(unittest.TestCase):
     def test_the_newest_copy_across_two_peers_wins(self):
         with tempfile.TemporaryDirectory() as tmp:
             old = self._peer(tmp, "desktop", "backup-1", {"psx/a.srm": 100.0})
-            new = self._peer(tmp, "w541", "backup-1", {"psx/a.srm": 900.0})
+            new = self._peer(tmp, "ubuntu", "backup-1", {"psx/a.srm": 900.0})
             self._patch([old, new], {
                 name: {"games": {"RetroFrontend": {
                     "backupPath": str(Path(tmp) / name / "RetroFrontend"),
                     "backups": [{"name": "backup-1"}]}}}
-                for name in ("desktop", "w541")})
+                for name in ("desktop", "ubuntu")})
             with _config({"trees": {"RetroFrontend": {"roots": {
-                    "desktop": "/a/saves", "w541": "/a/saves"}}}}):
+                    "desktop": "/a/saves", "ubuntu": "/a/saves"}}}}):
                 index = savepick.peer_tree_index("RetroFrontend",
                                                  {"device_dir": "deck"})
             self.assertEqual(index["psx/a.srm"][0], 900.0)
-            self.assertEqual(index["psx/a.srm"][2], "w541")
+            self.assertEqual(index["psx/a.srm"][2], "ubuntu")
 
     def test_an_unreadable_peer_is_skipped_not_fatal(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -3743,6 +3746,116 @@ class TestAStopSignalStillBacksUp(unittest.TestCase):
         self.assertEqual(savepick.STOP_DEADLINE, [])
 
 
+class TestTheWholeGameStops(unittest.TestCase):
+    """A stop that reaches savepick alone must still stop the game itself.
+
+    On a Linux laptop on 2026-09-28 a SIGTERM to savepick went to
+    steam-launch-wrapper, which died of it without passing it on. The exit
+    backup ran while Getting Over It kept playing for three more minutes.
+    """
+
+    def setUp(self):
+        self.saved = {n: getattr(savepick, n) for n in
+                      ("GAME_STOP_SECONDS", "LEFTOVER_GRACE_SECONDS")}
+        savepick.CHILD = None
+        savepick.STOP_DEADLINE = []
+        del savepick.STOP_TREE[:]
+        del savepick.SIGNALS_SEEN[:]
+
+    def tearDown(self):
+        for name, value in self.saved.items():
+            setattr(savepick, name, value)
+        savepick.CHILD = None
+        savepick.STOP_DEADLINE = []
+        del savepick.STOP_TREE[:]
+        del savepick.SIGNALS_SEEN[:]
+
+    def test_descendants_follow_the_whole_chain(self):
+        table = {10: 1, 11: 10, 12: 11, 13: 12, 20: 1, 21: 20}
+        self.assertEqual(savepick.descendants(10, table), [11, 12, 13])
+        self.assertEqual(savepick.descendants(13, table), [])
+
+    def test_nothing_left_means_no_extra_signal(self):
+        savepick.STOP_TREE[:] = [(999999999, None)]
+        with mock.patch.object(savepick.os, "kill") as kill:
+            savepick.wait_for_leftovers()
+        kill.assert_not_called()
+        self.assertEqual(savepick.STOP_TREE, [])
+
+    @unittest.skipIf(os.name == "nt", "the chain is a Linux and Mac thing")
+    def test_a_launcher_that_dies_does_not_leave_the_game_running(self):
+        import signal
+        import subprocess
+        savepick.GAME_STOP_SECONDS = 10
+        savepick.LEFTOVER_GRACE_SECONDS = 0.5
+        # The shell is the launcher, the sleep is the game. SIGTERM kills the
+        # shell and never reaches the sleep, as with steam-launch-wrapper.
+        proc = subprocess.Popen(["sh", "-c", "sleep 300 & wait"],
+                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        game = []
+        try:
+            deadline = time.monotonic() + 5
+            while not game and time.monotonic() < deadline:
+                game = savepick.descendants(proc.pid)
+                time.sleep(0.05)
+            self.assertTrue(game, "the game never started")
+            savepick.CHILD = proc
+            savepick.SIGNALS_SEEN.append(signal.SIGTERM)
+            self.assertTrue(savepick.stop_child(signal.SIGTERM))
+            self.assertEqual([pid for pid, _start in savepick.STOP_TREE], game)
+            savepick.wait_for_child(proc)
+            for pid in game:
+                self.assertFalse(savepick.still_running(pid, None),
+                                 "pid %d outlived the stop" % pid)
+        finally:
+            for pid in set(game + savepick.descendants(proc.pid) + [proc.pid]):
+                try:
+                    os.kill(pid, signal.SIGKILL)
+                except OSError:
+                    pass
+            proc.wait()
+
+
+class TestRemotePlay(unittest.TestCase):
+    """A game streamed with Steam Remote Play runs on the host, nobody there."""
+
+    def test_steam_marks_a_streamed_launch(self):
+        self.assertTrue(savepick.remote_play({"SteamStreaming": "1"}))
+        self.assertFalse(savepick.remote_play({"SteamStreaming": "0"}))
+        self.assertFalse(savepick.remote_play({}))
+
+    def test_the_first_log_line_says_it_streams(self):
+        line = savepick.started_line({"SteamAppId": "240720", "SteamStreaming": "1",
+                                      "SteamStreamingMaximumResolution": "1728x1080"})
+        self.assertIn("240720", line)
+        self.assertIn("Remote Play", line)
+        self.assertIn("1728x1080", line)
+        self.assertNotIn("Remote Play", savepick.started_line({"SteamAppId": "1"}))
+
+    def test_no_question_is_asked_on_the_host(self):
+        with mock.patch.dict(os.environ, {"SteamStreaming": "1"}), \
+                mock.patch.object(savepick, "ask_linux") as linux, \
+                mock.patch.object(savepick, "ask_mac") as mac, \
+                mock.patch.object(savepick, "ask_windows") as windows:
+            self.assertIsNone(savepick.ask_user("G", 1, "backup", 2))
+        for dialog in (linux, mac, windows):
+            dialog.assert_not_called()
+        # Nobody answering is never a restore.
+        self.assertEqual(savepick.resolve_ask(None), savepick.SKIP)
+
+    def test_a_warning_goes_to_the_log_only(self):
+        with mock.patch.dict(os.environ, {"SteamStreaming": "1"}), \
+                mock.patch.object(savepick, "zenity_candidates") as zenity, \
+                mock.patch.object(savepick, "run_osascript") as osa, \
+                mock.patch.object(savepick, "run_powershell_dialog") as ps, \
+                mock.patch.object(savepick, "log") as log:
+            savepick.show_warning("BlockSlot", "Backup FAILED")
+        zenity.assert_not_called()
+        osa.assert_not_called()
+        ps.assert_not_called()
+        self.assertIn("NOT shown", log.call_args[0][0])
+
+
 class TestBorderless(unittest.TestCase):
     """--borderless takes a windowed game's frame off and fits it to the screen.
 
@@ -3924,8 +4037,9 @@ class TestStoreMode(unittest.TestCase):
             self.waits = list(waits or [{"state": "committed"}])
             self.calls = []
 
-        def decide(self, game, hashes):
+        def decide(self, game, hashes, os_family=None):
             self.calls.append(("decide", game))
+            self.os_family = os_family
             return self.answer
 
         def fetch(self, game, snap, into):
@@ -3942,8 +4056,9 @@ class TestStoreMode(unittest.TestCase):
         def choose(self, game, snap):
             self.calls.append(("choose", snap))
 
-        def stage(self, game, source, played=None, mode="game"):
+        def stage(self, game, source, played=None, mode="game", os_family=None):
             self.calls.append(("stage", sorted(os.listdir(source))))
+            self.staged_os = os_family
             return {"snap": "S1"}
 
         def wait(self, snap, timeout):
@@ -4025,7 +4140,7 @@ class TestStoreMode(unittest.TestCase):
 
     def test_a_decide_that_raises_is_unknown(self):
         worker = self.Worker(None)
-        worker.decide = lambda game, hashes: (_ for _ in ()).throw(OSError("gone"))
+        worker.decide = lambda game, hashes, **kw: (_ for _ in ()).throw(OSError("gone"))
         savepick.store_before_launch(worker, "nas", "G")
         self.assertIn("Could not check", self.warnings[0])
 
@@ -4054,6 +4169,21 @@ class TestStoreMode(unittest.TestCase):
         savepick.store_before_launch(worker, "nas", "G")
         self.assertIn(("base", "B", ("D",)), worker.calls)
         self.assertNotIn(("fetch", "D"), worker.calls)
+
+    def test_a_remote_play_launch_decides_nothing_and_shows_nothing(self):
+        """Nobody is at the host of a stream. No dialog, no restore, no base:
+        the fork stays open for the next launch in front of a screen."""
+        savepick.ask_user = self.saved["ask_user"]
+        for name in ("ask_linux", "ask_mac", "ask_windows"):
+            self.saved.setdefault(name, getattr(savepick, name))
+            setattr(savepick, name, lambda *a, **k: self.fail("a dialog opened"))
+        worker = self.Worker({"action": "ask", "base": "B", "choices": [
+            {"id": "D", "device": "deck", "played_end": "2026-09-24T01:00:00Z"}]})
+        with mock.patch.dict(os.environ, {"SteamStreaming": "1"}):
+            savepick.store_before_launch(worker, "nas", "G")
+        self.assertEqual([c for c in worker.calls if c[0] != "decide"], [])
+        with open(self.live, "rb") as handle:
+            self.assertEqual(handle.read(), b"local")
 
     def fake_backup(self, ok=True):
         real_run = savepick.subprocess.run
@@ -4121,6 +4251,55 @@ class TestStoreMode(unittest.TestCase):
         self.assertEqual(len(attempts), 2)
         self.assertIn(("base", "R", ()), worker.calls)
         self.assertEqual(self.warnings, [])
+
+    # The Steam commands as the logs show them. The Ubuntu laptop runs Getting
+    # Over It's native Linux build; the Deck runs Dark Souls II through Proton.
+    NATIVE = ["/home/player/snap/steam/common/.local/share/Steam/ubuntu12_32/reaper",
+              "SteamLaunch", "AppId=240720", "--",
+              "/home/player/snap/steam/common/.local/share/Steam/steamapps/common/"
+              "SteamLinuxRuntime_soldier/_v2-entry-point", "--verb=waitforexitandrun", "--",
+              "/home/player/snap/steam/common/.local/share/Steam/steamapps/common/"
+              "Getting Over It/GettingOverIt.x86_64"]
+    PROTON = ["/home/deck/.local/share/Steam/ubuntu12_32/reaper", "SteamLaunch",
+              "AppId=335300", "--",
+              "/home/deck/.local/share/Steam/steamapps/common/SteamLinuxRuntime_sniper/"
+              "_v2-entry-point", "--verb=waitforexitandrun", "--",
+              "/home/deck/.local/share/Steam/steamapps/common/Proton 9.0 (Beta)/proton",
+              "waitforexitandrun",
+              "/home/deck/.local/share/Steam/steamapps/common/Dark Souls II Scholar of "
+              "the First Sin/Game/DarkSoulsII.exe"]
+
+    def test_a_proton_launch_is_a_windows_game(self):
+        self.assertTrue(savepick.runs_under_wine(self.PROTON) or savepick.is_windows())
+        self.assertFalse(savepick.runs_under_wine(self.NATIVE))
+        self.assertFalse(savepick.runs_under_wine(["/usr/bin/wine-ish-tool", "x"]))
+        self.assertTrue(savepick.runs_under_wine(["/usr/bin/wine64", "C:\\g.exe"])
+                        or savepick.is_windows())
+
+    def test_the_os_of_this_launch_goes_to_the_daemon_and_the_upload(self):
+        import slotstore
+        worker = self.Worker({"action": "launch"})
+        family = savepick.store_before_launch(worker, "nas", "G", command=self.PROTON)
+        self.assertEqual(family, slotstore.WINDOWS)
+        self.assertEqual(worker.os_family, slotstore.WINDOWS)
+        self.fake_backup()
+        savepick.store_after_exit(worker, "nas", "G", {}, os_family=family)
+        self.assertEqual(worker.staged_os, slotstore.WINDOWS)
+
+    def test_a_native_launch_is_this_machines_os(self):
+        import slotstore
+        worker = self.Worker({"action": "launch"})
+        family = savepick.store_before_launch(worker, "nas", "G", command=self.NATIVE)
+        self.assertEqual(family, slotstore.host_family())
+
+    def test_a_save_in_a_wine_prefix_is_windows_whatever_the_launch(self):
+        import slotstore
+        prefix = os.path.join(self.dir, "pfx", "drive_c", "users", "steamuser")
+        os.makedirs(prefix)
+        live = os.path.join(prefix, "save.sl2")
+        with open(live, "wb") as handle:
+            handle.write(b"x")
+        self.assertEqual(savepick.save_family(["/opt/launcher"], [live]), slotstore.WINDOWS)
 
     def test_a_failed_backup_stages_nothing(self):
         self.fake_backup(ok=False)
@@ -4264,6 +4443,19 @@ class TestStoreLibraries(unittest.TestCase):
         self.assertEqual(len(self.asked), 1)
         self.assertEqual(self.read("pc", "SPRJ0005/userdata0000", "Bloodborne"), b"pc")
 
+    def test_a_streamed_one_game_library_leaves_both_saves_for_later(self):
+        self.put("deck", "SPRJ0005/userdata0000", b"deck", 1600000000, "Bloodborne")
+        self.session("deck", "Bloodborne")
+        self.put("pc", "SPRJ0005/userdata0000", b"pc", 1700000000, "Bloodborne")
+        savepick.ask_user = self.saved["ask_user"]
+        with mock.patch.dict(os.environ, {"SteamStreaming": "1"}):
+            self.session("pc", "Bloodborne")
+        self.assertEqual(self.read("pc", "SPRJ0005/userdata0000", "Bloodborne"), b"pc")
+        # Undecided, so the next launch at the pc's own screen still asks.
+        savepick.ask_user = lambda *a, **k: self.asked.append(a) or False
+        self.session("pc", "Bloodborne")
+        self.assertEqual(len(self.asked), 1)
+
     def test_units_carry_their_label(self):
         self.put("deck", "snes/Mario.srm", b"a", 1600000000)
         units = savepick.library_units("Retro", Path(self.roots["deck"]))
@@ -4306,6 +4498,595 @@ class TestTheLogSurvivesARestart(unittest.TestCase):
         finally:
             savepick.LOG_PATH = old
             shutil.rmtree(str(where.parent.parent), ignore_errors=True)
+
+class _Done(object):
+    def __init__(self, returncode=0, stdout="", stderr=""):
+        self.returncode = returncode
+        self.stdout = stdout
+        self.stderr = stderr
+
+
+class AskOnAMac(unittest.TestCase):
+    """osascript's dialog: keep is the default, and so is running out of time."""
+
+    def _ask(self, done):
+        calls = []
+
+        def run(command, **_kwargs):
+            calls.append(command)
+            if isinstance(done, Exception):
+                raise done
+            return done
+        answer = savepick.ask_mac("Getting Over It", "today", "desk save",
+                                  "yesterday", keep_label="Keep this device",
+                                  restore_label="Use the desk save", run=run)
+        return answer, calls
+
+    def test_choosing_the_other_save_restores(self):
+        answer, calls = self._ask(_Done(stdout="RESTORE\n"))
+        self.assertIs(answer, True)
+        command = calls[0]
+        self.assertEqual(command[0], savepick.OSASCRIPT)
+        # Everything a person can read travels as an argument, never inside
+        # the script, so a quote in a game's name cannot break it.
+        script = " ".join(command[:command.index("end run") + 1])
+        self.assertNotIn("Getting Over It", script)
+        self.assertEqual(command[-3:], ["Keep this device", "Use the desk save",
+                                        str(savepick.DIALOG_TIMEOUT_SECONDS)])
+        self.assertIn("Getting Over It", command[-5])
+
+    def test_keeping_this_device_keeps(self):
+        self.assertIs(self._ask(_Done(stdout="KEEP\n"))[0], False)
+
+    def test_running_out_of_time_keeps(self):
+        self.assertIs(self._ask(_Done(stdout="TIMEOUT\n"))[0], False)
+
+    def test_no_dialog_is_no_answer(self):
+        self.assertIsNone(self._ask(_Done(returncode=1, stderr="-1713"))[0])
+        self.assertIsNone(self._ask(OSError("no osascript"))[0])
+
+
+class TheFirstManifest(unittest.TestCase):
+    """A device that never fetched ludusavi's manifest fetches it once."""
+
+    def setUp(self):
+        self.dir = Path(tempfile.mkdtemp(prefix="savepick-manifest-"))
+        self.addCleanup(shutil.rmtree, str(self.dir), True)
+        binary = self.dir / ("ludusavi.exe" if os.name == "nt" else "ludusavi")
+        binary.write_bytes(b"")
+        # Portable: the config sits beside the binary on every OS.
+        (self.dir / "ludusavi.portable").write_text("")
+        self.addCleanup(os.environ.pop, "SAVEPICK_LUDUSAVI", None)
+        os.environ["SAVEPICK_LUDUSAVI"] = str(binary)
+        self.binary = binary
+
+    def test_the_config_folder_is_ludusavis_own(self):
+        self.assertEqual(savepick.ludusavi_config_dir(), self.dir)
+
+    def test_a_manifest_that_is_there_is_left_alone(self):
+        (self.dir / "manifest.yaml").write_text("{}")
+        calls = []
+        self.assertTrue(savepick.ensure_manifest(run=lambda *a, **k: calls.append(a)))
+        self.assertEqual(calls, [])
+
+    def test_a_missing_manifest_is_forced_down_once(self):
+        calls = []
+
+        def run(command, **kwargs):
+            calls.append((command, kwargs.get("timeout")))
+            (self.dir / "manifest.yaml").write_text("{}")
+            return _Done()
+        self.assertTrue(savepick.ensure_manifest(run=run))
+        self.assertEqual(calls, [([str(self.binary), "manifest", "update", "--force"],
+                                  savepick.MANIFEST_FETCH_SECONDS)])
+        self.assertTrue(savepick.ensure_manifest(run=run))
+        self.assertEqual(len(calls), 1)
+
+    def test_no_ludusavi_fetches_nothing(self):
+        self.binary.unlink()
+        calls = []
+        self.assertFalse(savepick.ensure_manifest(run=lambda *a, **k: calls.append(a)))
+        self.assertEqual(calls, [])
+
+    def test_offline_is_logged_and_the_launch_goes_on(self):
+        def run(command, **kwargs):
+            raise OSError("network unreachable")
+        self.assertFalse(savepick.ensure_manifest(run=run))
+
+
+@unittest.skipIf(savepick.is_windows(), "the Steam snap is Linux")
+class TestSnapSteam(unittest.TestCase):
+    """A game started by snap Steam: HOME is the snap's, Blockslot's files are not.
+
+    The environment is the one probed on an Ubuntu 26.04 laptop (steam snap rev
+    271) on 2026-09-28.
+    """
+
+    def setUp(self):
+        from unittest import mock
+        self.real = Path(tempfile.mkdtemp(prefix="savepick-home-"))
+        self.addCleanup(shutil.rmtree, str(self.real), True)
+        inside = self.real / "snap" / "steam" / "common"
+        env = {"SNAP_NAME": "steam", "SNAP_REAL_HOME": str(self.real),
+               "HOME": str(inside), "XDG_CONFIG_HOME": str(inside / ".config"),
+               "XDG_DATA_HOME": str(inside / ".local" / "share"),
+               "XDG_STATE_HOME": str(inside / ".local" / "state")}
+        patcher = mock.patch.dict(os.environ, env)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        os.environ.pop("SAVEPICK_LUDUSAVI", None)
+
+    def test_it_knows_it_is_in_the_snap(self):
+        self.assertTrue(savepick.in_snap())
+        self.assertEqual(savepick.real_home(), self.real)
+
+    def test_settings_log_vault_and_ludusavi_are_under_the_real_home(self):
+        self.assertEqual(savepick.config_path(), self.real / ".config" / "savepick.json")
+        self.assertEqual(savepick._log_path(),
+                         self.real / ".local" / "state" / "blockslot" / "savepick.log")
+        self.assertEqual(savepick.vault_root(),
+                         self.real / ".local" / "share" / "savepick" / "vault")
+        self.assertEqual(savepick.ludusavi_binary(),
+                         str(self.real / ".local" / "bin" / "ludusavi"))
+
+    def test_folders_for_the_daemon_are_ones_it_can_see(self):
+        # The snap's /tmp is private to it; the daemon outside cannot read it.
+        parent = Path(savepick.handoff_parent())
+        self.assertEqual(parent, self.real / ".local" / "state" / "blockslot" / "handoff")
+        where = Path(savepick.handoff_dir("blockslot-fetch-"))
+        self.assertEqual(where.parent, parent)
+        self.assertTrue(where.is_dir())
+
+    def test_a_syncthing_folder_under_home_is_the_real_home(self):
+        # Syncthing runs outside the snap; its "~" is the person's home.
+        self.assertEqual(savepick.expand_home("~/Sync"), self.real / "Sync")
+        self.assertEqual(savepick.expand_home("/srv/Sync"), Path("/srv/Sync"))
+
+    def test_outside_the_snap_nothing_moves(self):
+        os.environ.pop("SNAP_NAME")
+        self.assertFalse(savepick.in_snap())
+        self.assertIsNone(savepick.handoff_parent())
+        self.assertEqual(savepick.config_path(), Path.home() / ".config" / "savepick.json")
+        self.assertEqual(savepick.vault_root(),
+                         self.real / "snap" / "steam" / "common" / ".local" / "share"
+                         / "savepick" / "vault")
+
+
+class FakeCfprefsd:
+    """Stands in for /usr/bin/defaults and the cfprefsd behind it.
+
+    It does what the real one did on a macOS 26.6 VM (2026-09-28): export
+    of an unknown domain is an empty dict, import MERGES into the domain, and
+    delete leaves an empty plist behind rather than no file.
+    """
+
+    def __init__(self, prefs_dir):
+        self.dir = prefs_dir
+        self.domains = {}
+        self.calls = []
+        self.import_fails = False
+
+    def path(self, domain):
+        return os.path.join(self.dir, domain + ".plist")
+
+    def _write(self, domain):
+        with open(self.path(domain), "wb") as handle:
+            handle.write(plistlib.dumps(self.domains.get(domain, {}),
+                                        fmt=plistlib.FMT_BINARY))
+
+    def __call__(self, args, timeout=None):
+        self.calls.append(list(args))
+        verb, domain = args[0], args[1]
+        if verb == "export":
+            return 0, plistlib.dumps(self.domains.get(domain, {}))
+        if verb == "delete":
+            if domain not in self.domains:
+                return 1, b""
+            self.domains[domain] = {}
+            self._write(domain)
+            return 0, b""
+        if verb == "import":
+            if self.import_fails:
+                return 1, b""
+            with open(args[2], "rb") as handle:
+                self.domains.setdefault(domain, {}).update(plistlib.loads(handle.read()))
+            self._write(domain)
+            return 0, b""
+        return 1, b""
+
+
+class _MacPrefs(unittest.TestCase):
+    """A fake macOS: a temp Preferences folder and a fake cfprefsd."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="savepick-prefs-")
+        self.prefs = os.path.join(self.tmp, "Library", "Preferences")
+        os.makedirs(self.prefs)
+        self.fake = FakeCfprefsd(self.prefs)
+        self.saved = (savepick.is_macos, savepick.preferences_dir, savepick.run_defaults)
+        savepick.is_macos = lambda: True
+        savepick.preferences_dir = lambda: self.prefs
+        savepick.run_defaults = self.fake
+
+    def tearDown(self):
+        savepick.is_macos, savepick.preferences_dir, savepick.run_defaults = self.saved
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def put_file(self, domain, values):
+        path = self.fake.path(domain)
+        with open(path, "wb") as handle:
+            handle.write(plistlib.dumps(values, fmt=plistlib.FMT_BINARY))
+        return path
+
+    def file_values(self, path):
+        with open(path, "rb") as handle:
+            return plistlib.loads(handle.read())
+
+
+class TestPreferenceDomains(_MacPrefs):
+
+    def test_only_top_level_preferences_plists(self):
+        game = os.path.join(self.prefs, "net.Foddy.GettingOverIt.plist")
+        byhost = os.path.join(self.prefs, "ByHost", "net.Foddy.x.plist")
+        other = os.path.join(self.tmp, "Documents", "save.plist")
+        notplist = os.path.join(self.prefs, "readme.txt")
+        self.assertEqual(savepick.preference_domains([game, byhost, other, notplist, game]),
+                         [(game, "net.Foddy.GettingOverIt")])
+
+    def test_nothing_off_macos(self):
+        savepick.is_macos = lambda: False
+        game = self.put_file("net.Foddy.GettingOverIt", {"a": 1})
+        self.assertEqual(savepick.preference_domains([game]), [])
+        self.assertTrue(savepick.reload_preferences([game]))
+        savepick.flush_preferences([game])
+        self.assertEqual(self.fake.calls, [])
+
+
+class TestFlushPreferences(_MacPrefs):
+    """Before a backup the file must say what cfprefsd holds."""
+
+    def test_a_stale_file_takes_what_cfprefsd_holds(self):
+        path = self.put_file("g.test", {"height": 1})
+        self.fake.domains["g.test"] = {"height": 99}
+        savepick.flush_preferences([path])
+        self.assertEqual(self.file_values(path), {"height": 99})
+
+    def test_a_file_in_step_is_not_touched(self):
+        path = self.put_file("g.test", {"height": 1})
+        self.fake.domains["g.test"] = {"height": 1}
+        with open(path, "rb") as handle:
+            before = handle.read()
+        os.utime(path, (1000, 1000))
+        savepick.flush_preferences([path])
+        with open(path, "rb") as handle:
+            self.assertEqual(handle.read(), before)
+        self.assertEqual(os.stat(path).st_mtime, 1000)
+
+    def test_an_empty_domain_never_blanks_a_save(self):
+        path = self.put_file("g.test", {"height": 1})
+        savepick.flush_preferences([path])
+        self.assertEqual(self.file_values(path), {"height": 1})
+
+    def test_no_defaults_leaves_the_file(self):
+        path = self.put_file("g.test", {"height": 1})
+        savepick.run_defaults = lambda args, timeout=None: (None, b"")
+        savepick.flush_preferences([path])
+        self.assertEqual(self.file_values(path), {"height": 1})
+
+
+class TestReloadPreferences(_MacPrefs):
+    """After a restore cfprefsd must hold the restored save, and only it."""
+
+    def test_the_restored_save_replaces_what_was_cached(self):
+        self.fake.domains["g.test"] = {"height": 99, "only_old": True}
+        path = self.put_file("g.test", {"height": 1})
+        self.assertTrue(savepick.reload_preferences([path]))
+        # import merges, so without the delete first only_old would survive.
+        self.assertEqual(self.fake.domains["g.test"], {"height": 1})
+        self.assertEqual([c[0] for c in self.fake.calls], ["delete", "import", "export"])
+
+    def test_the_bytes_on_disk_are_the_restored_ones(self):
+        path = self.put_file("g.test", {"height": 1, "name": "x"})
+        with open(path, "rb") as handle:
+            restored = handle.read()
+        # A cfprefsd that writes the same values as other bytes.
+        self.fake._write = lambda domain: open(self.fake.path(domain), "wb").close()
+        self.assertTrue(savepick.reload_preferences([path]))
+        with open(path, "rb") as handle:
+            self.assertEqual(handle.read(), restored)
+
+    def test_a_failed_import_says_so_and_keeps_the_save(self):
+        self.fake.domains["g.test"] = {"height": 99}
+        path = self.put_file("g.test", {"height": 1})
+        self.fake.import_fails = True
+        self.assertFalse(savepick.reload_preferences([path]))
+        # delete emptied the file; the restored bytes were put back.
+        self.assertEqual(self.file_values(path), {"height": 1})
+
+    def test_an_unreadable_plist_is_a_failure(self):
+        path = os.path.join(self.prefs, "g.test.plist")
+        with open(path, "wb") as handle:
+            handle.write(b"not a plist")
+        self.assertFalse(savepick.reload_preferences([path]))
+        self.assertEqual(self.fake.calls, [])
+
+    def test_a_missing_file_is_nothing_to_do(self):
+        self.assertTrue(savepick.reload_preferences(
+            [os.path.join(self.prefs, "g.test.plist")]))
+
+
+class TestPreferencesAroundLudusavi(_MacPrefs):
+    """The restore and the backup both go through cfprefsd on macOS."""
+
+    def setUp(self):
+        super().setUp()
+        self.real = (savepick.run_json, savepick.save_landed,
+                     savepick.live_save_files, savepick.subprocess.run)
+
+    def tearDown(self):
+        (savepick.run_json, savepick.save_landed,
+         savepick.live_save_files, savepick.subprocess.run) = self.real
+        super().tearDown()
+
+    def test_restore_now_fails_when_cfprefsd_does_not_take_it(self):
+        path = self.put_file("g.test", {"height": 1})
+        savepick.run_json = lambda args, **kw: {"games": {}}
+        savepick.save_landed = lambda game, mtime: True
+        savepick.live_save_files = lambda game: [path]
+        self.fake.import_fails = True
+        self.assertFalse(savepick.restore_now("G", 9000.0, "b", Path(self.tmp)))
+        self.fake.import_fails = False
+        self.assertTrue(savepick.restore_now("G", 9000.0, "b", Path(self.tmp)))
+        self.assertEqual(self.fake.domains["g.test"], {"height": 1})
+
+    def test_a_restore_keeps_the_backups_mtime(self):
+        # ludusavi restores with the backup's mtime and save_landed checks it.
+        # cfprefsd rewriting the file must not turn that into now.
+        self.fake.domains["g.test"] = {"height": 99, "only_old": True}
+        path = self.put_file("g.test", {"height": 1})
+        os.utime(path, (9000, 9000))
+        savepick.run_json = lambda args, **kw: {"games": {}}
+        savepick.live_save_files = lambda game: [path]
+        self.assertTrue(savepick.restore_now("G", 9000.0, "b", Path(self.tmp)))
+        self.assertEqual(os.stat(path).st_mtime, 9000)
+        self.assertEqual(self.fake.domains["g.test"], {"height": 1})
+
+    def test_the_exit_backup_flushes_first(self):
+        path = self.put_file("g.test", {"height": 1})
+        self.fake.domains["g.test"] = {"height": 99}
+        savepick.live_save_files = lambda game: [path]
+        seen = []
+
+        class Done:
+            returncode = 0
+            stdout = stderr = ""
+
+        def run(cmd, **kw):
+            seen.append(self.file_values(path))
+            return Done()
+        savepick.subprocess.run = run
+        self.assertEqual(savepick.run_backup("G"), (False, ""))
+        self.assertEqual(seen, [{"height": 99}])
+
+
+@unittest.skipUnless(sys.platform == "darwin" and shutil.which("defaults"),
+                     "cfprefsd is macOS only")
+class TestPreferencesLive(unittest.TestCase):
+    """The real cfprefsd, on a throwaway domain that is deleted afterwards."""
+
+    def setUp(self):
+        self.domain = "com.blockslot.selftest.%d" % os.getpid()
+        self.path = os.path.join(savepick.preferences_dir(), self.domain + ".plist")
+
+    def tearDown(self):
+        savepick.run_defaults(["delete", self.domain])
+        try:
+            os.remove(self.path)
+        except OSError:
+            pass
+
+    def test_restore_then_backup(self):
+        savepick.run_defaults(["write", self.domain, "stale", "-int", "1"])
+        # What ludusavi does: copy the backup over the file.
+        restored = {"height": 42, "name": "summit"}
+        with open(self.path, "wb") as handle:
+            handle.write(plistlib.dumps(restored, fmt=plistlib.FMT_BINARY))
+        self.assertTrue(savepick.reload_preferences([self.path]))
+        self.assertEqual(savepick.domain_values(self.domain), restored)
+        # The game plays and saves through cfprefsd; the backup must see it.
+        savepick.run_defaults(["write", self.domain, "height", "-int", "43"])
+        savepick.flush_preferences([self.path])
+        with open(self.path, "rb") as handle:
+            self.assertEqual(plistlib.loads(handle.read()),
+                             {"height": 43, "name": "summit"})
+
+
+class MacDialogs(unittest.TestCase):
+    """macOS: every window the picker shows is osascript's display dialog."""
+
+    def setUp(self):
+        self.calls = []
+        self.real_run = savepick.run_osascript
+        self.real_mac = savepick.is_mac
+        self.real_windows = savepick.is_windows
+        savepick.is_mac = lambda: True
+        savepick.is_windows = lambda: False
+        self.answer = (0, "KEEP", "")
+
+        def fake(script, args, timeout):
+            self.calls.append((script, list(args), timeout))
+            return self.answer
+
+        savepick.run_osascript = fake
+
+    def tearDown(self):
+        savepick.run_osascript = self.real_run
+        savepick.is_mac = self.real_mac
+        savepick.is_windows = self.real_windows
+
+    def ask(self):
+        return savepick.ask_user("Getting Over It", time.time(), "deck save",
+                                 time.time() - 3600)
+
+    def test_the_restore_button_restores(self):
+        self.answer = (0, "RESTORE", "")
+        self.assertIs(self.ask(), True)
+
+    def test_keep_and_the_timeout_both_keep(self):
+        for answer in ("KEEP", "TIMEOUT"):
+            self.answer = (0, answer, "")
+            self.assertIs(self.ask(), False)
+
+    def test_no_window_server_is_no_answer_not_consent(self):
+        self.answer = (1, "", "execution error: No user interaction allowed. (-1713)")
+        self.assertIsNone(self.ask())
+        self.answer = None
+        self.assertIsNone(self.ask())
+
+    def test_the_words_travel_as_arguments(self):
+        self.ask()
+        script, args, _timeout = self.calls[0]
+        self.assertIs(script, savepick.MAC_ASK)
+        self.assertIn("Getting Over It", args[0])
+        self.assertEqual(args[2:], [savepick.KEEP_LABEL, savepick.RESTORE_LABEL,
+                                    savepick.DIALOG_TIMEOUT_SECONDS])
+
+    def test_a_warning_is_a_dialog_that_times_out(self):
+        savepick.show_warning("BlockSlot", "the store is not working")
+        script, args, timeout = self.calls[0]
+        self.assertIs(script, savepick.MAC_WARN)
+        self.assertEqual(args, ["the store is not working", "BlockSlot",
+                                savepick.WARNING_TIMEOUT_SECONDS])
+        self.assertGreater(timeout, savepick.WARNING_TIMEOUT_SECONDS)
+
+    def test_the_command_puts_each_line_then_the_arguments(self):
+        cmd = savepick.osascript_command(("on run argv", "end run"), ["a b", 5])
+        self.assertEqual(cmd, ["/usr/bin/osascript", "-e", "on run argv",
+                               "-e", "end run", "a b", "5"])
+
+    def test_every_script_guards_an_empty_run(self):
+        for script in (savepick.MAC_ASK, savepick.MAC_WARN, savepick.MAC_SPINNER):
+            self.assertEqual(script[0], "on run argv")
+            self.assertIn('return "READY"', script[1])
+            self.assertEqual(script[-1], "end run")
+
+
+class MacSpinner(unittest.TestCase):
+    def setUp(self):
+        self.real_mac = savepick.is_mac
+        self.real_windows = savepick.is_windows
+        self.real_popen = savepick.subprocess.Popen
+        savepick.is_mac = lambda: True
+        savepick.is_windows = lambda: False
+        self.started = []
+        test = self
+
+        class FakeProc(object):
+            stdin = None
+
+            def __init__(self, argv, **_kw):
+                test.started.append(argv)
+                self.code = None
+                self.terminated = False
+
+            def poll(self):
+                return self.code
+
+            def terminate(self):
+                self.terminated = True
+                self.code = -15
+
+            def wait(self, timeout=None):
+                return self.code
+
+        savepick.subprocess.Popen = FakeProc
+
+    def tearDown(self):
+        savepick.is_mac = self.real_mac
+        savepick.is_windows = self.real_windows
+        savepick.subprocess.Popen = self.real_popen
+
+    def test_it_shows_a_dialog_and_close_takes_it_down(self):
+        spinner = savepick.Spinner("BlockSlot", "Checking Getting Over It ...")
+        self.assertEqual(self.started[0][0], "/usr/bin/osascript")
+        self.assertEqual(self.started[0][-3:],
+                         ["Checking Getting Over It ...", "BlockSlot", "Hide"])
+        spinner.update("still checking", 40)
+        proc = spinner._proc
+        spinner.close()
+        self.assertTrue(proc.terminated)
+
+    def test_cancel_counts_only_when_pressed(self):
+        spinner = savepick.Spinner("BlockSlot", "Saving ...", cancellable=True)
+        self.assertEqual(self.started[0][-1], "Cancel")
+        self.assertFalse(spinner.cancelled())
+        spinner._proc.code = 1            # osascript could not draw at all
+        self.assertFalse(spinner.cancelled())
+        spinner._proc.code = 0            # Cancel pressed
+        self.assertTrue(spinner.cancelled())
+
+    def test_only_the_button_ends_the_spinner_cleanly(self):
+        # Exit 0 is Cancel. A default button would let a stray Return cancel,
+        # the hour's give-up must not end it, and an error that is not the
+        # Cancel button (-128) must not be swallowed into exit 0.
+        script = "\n".join(savepick.MAC_SPINNER)
+        self.assertNotIn("default button", script)
+        self.assertIn("on error number -128", script)
+        self.assertNotIn("on error\n", script)
+        self.assertIn("gave up of", script)
+
+
+class MacCommand(unittest.TestCase):
+    """The game's command line, as Steam on a Mac hands it over."""
+
+    GAME = ("/Users/a/Library/Application Support/Steam/steamapps/common/"
+            "Getting Over It/GettingOverIt.app/Contents/MacOS/GettingOverIt")
+    APP = ("/Users/a/Library/Application Support/Steam/steamapps/common/"
+           "Getting Over It/GettingOverIt.app")
+
+    def exists(self, path):
+        return path == self.GAME
+
+    def test_a_whole_path_is_left_alone(self):
+        self.assertEqual(savepick.rejoin_program([self.GAME, "-x"], self.exists),
+                         [self.GAME, "-x"])
+
+    def test_a_path_split_at_its_spaces_is_put_back(self):
+        words = self.GAME.split(" ") + ["-windowed"]
+        self.assertEqual(savepick.rejoin_program(words, self.exists),
+                         [self.GAME, "-windowed"])
+
+    def test_nothing_that_names_a_file_is_left_as_it_came(self):
+        self.assertEqual(savepick.rejoin_program(["nope", "x"], self.exists),
+                         ["nope", "x"])
+        self.assertEqual(savepick.rejoin_program([], self.exists), [])
+
+    def test_an_app_bundle_goes_through_open_and_waits(self):
+        is_dir = lambda path: path == self.APP
+        never = lambda _path: False
+        self.assertEqual(savepick.mac_command([self.APP], never, is_dir),
+                         ["/usr/bin/open", "-W", self.APP])
+        self.assertEqual(savepick.mac_command(self.APP.split(" ") + ["-w"], never, is_dir),
+                         ["/usr/bin/open", "-W", self.APP, "--args", "-w"])
+
+    def test_split_command_rejoins_only_on_a_mac(self):
+        real = savepick.is_mac
+        words = ["--", "/no/such/one", "two"]
+        try:
+            savepick.is_mac = lambda: False
+            self.assertEqual(savepick.split_command(words), ["/no/such/one", "two"])
+        finally:
+            savepick.is_mac = real
+
+
+@unittest.skipUnless(sys.platform == "darwin", "macOS only")
+class MacScriptsCompile(unittest.TestCase):
+    """Run with no arguments, each script compiles and answers without a window."""
+
+    def test_each_script_parses(self):
+        for script in (savepick.MAC_ASK, savepick.MAC_WARN, savepick.MAC_SPINNER):
+            result = savepick.run_osascript(script, [], 30)
+            self.assertEqual(result[:2], (0, "READY"), result)
 
 
 if __name__ == "__main__":

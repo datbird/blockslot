@@ -25,7 +25,7 @@ try:
 except ImportError:
     HAVE_TK = False
 
-from gui.tests.test_ui import StubController, can_open_a_window  # noqa: E402
+from gui.tests.test_ui import StubController, can_open_a_window, open_window  # noqa: E402
 
 NOW = 1790000000.0
 
@@ -155,13 +155,11 @@ class InPlace(object):
 @unittest.skipUnless(HAVE_TK and can_open_a_window(), "no display")
 class TheScreen(unittest.TestCase):
     def setUp(self):
-        from gui.ui import app as app_mod
         self.dir = Path(tempfile.mkdtemp(prefix="blockslot-sets-"))
         self.addCleanup(shutil.rmtree, str(self.dir), True)
         self.controller = StubController()
         self.controller.settings.path = self.dir / "savepick.json"
-        self.window = app_mod.App(self.controller, size=(1280, 800))
-        self.addCleanup(self.window.destroy)
+        self.window = open_window(self, self.controller)
 
     def build(self):
         self.window.add_screens([("sets", savesets.TITLE, savesets.SaveSetsScreen)])

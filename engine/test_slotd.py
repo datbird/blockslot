@@ -6,14 +6,19 @@
 import json
 import os
 import shutil
+import sys
 import tempfile
 import threading
+import shlex
+import subprocess
+import sys
 import time
 import unittest
+from unittest import mock
 
 import slotd
 import slotstore as ss
-from test_slotstore import GAME, backup_dir
+from test_slotstore import GAME, GOI, backup_dir, os_backup
 
 
 class Base(unittest.TestCase):
@@ -49,7 +54,9 @@ class TheDaemon(Base):
         deck = self.daemon("deck")
         snap, _ = self.session(deck, b"A")
         pc = self.daemon("pc")
-        answer = pc.decide(GAME, [])
+        # The pc has never played it; the picker says it runs the Windows
+        # build, the family of the Deck's (drive-C) save.
+        answer = pc.decide(GAME, [], os_family=ss.WINDOWS)
         self.assertEqual(answer["action"], ss.RESTORE)
         self.assertEqual(answer["restore"]["id"], snap)
         self.assertEqual(answer["restore"]["device"], "deck")
@@ -264,6 +271,135 @@ class Keeping(Base):
         self.assertIsNotNone(d.maybe_clean(now=time.time() + slotd.CLEAN_EVERY + 5))
 
 
+class OperatingSystems(Base):
+    """Each OS family keeps its own history; the daemon decides within one.
+
+    The 2026-09-28 bug: a Linux save of Getting Over It was the newest, the
+    Mac restored it, ludusavi could not write a Linux path there, and the
+    player was told the restore did not finish.
+    """
+
+    def play(self, d, kind, save, os_family=None, game=GOI):
+        source = os_backup(tempfile.mkdtemp(dir=self.dir), kind, save)
+        staged = d.stage(game, source, played={"start": ss.iso(), "end": ss.iso()},
+                         os_family=os_family)
+        self.assertEqual(d.wait(staged["snap"], 10), {"state": "committed"})
+        return staged["snap"]
+
+    def hashes(self, snap, game=GOI):
+        return sorted(ss.save_hashes(ss.read_game(self.store, game).manifests[snap]))
+
+    def test_the_mac_ignores_a_newer_linux_save(self):
+        mac, ubuntu = self.daemon("imac"), self.daemon("ubuntu")
+        m = self.play(mac, "mac", b"mac")
+        self.play(ubuntu, "linux", b"linux")
+        answer = mac.decide(GOI, self.hashes(m), os_family=ss.MAC)
+        self.assertEqual(answer["action"], ss.LAUNCH)
+        self.assertEqual(answer["os"], ss.MAC)
+        self.assertEqual([h["id"] for h in answer["heads"]], [m])
+        # Asked with no word from the picker (an older one), its own history
+        # says it plays the Mac build.
+        self.assertEqual(mac.decide(GOI, self.hashes(m))["action"], ss.LAUNCH)
+
+    def test_linux_ignores_a_newer_mac_save(self):
+        mac, ubuntu = self.daemon("imac"), self.daemon("ubuntu")
+        l1 = self.play(ubuntu, "linux", b"linux")
+        self.play(mac, "mac", b"mac")
+        self.assertEqual(ubuntu.decide(GOI, self.hashes(l1), os_family=ss.LINUX)["action"],
+                         ss.LAUNCH)
+        laptop = self.daemon("laptop")
+        answer = laptop.decide(GOI, [], os_family=ss.LINUX)
+        self.assertEqual((answer["action"], answer["restore"]["id"]), (ss.RESTORE, l1))
+        self.assertEqual(answer["restore"]["os"], ss.LINUX)
+
+    def test_the_deck_and_a_linux_desktop_share(self):
+        deck, ubuntu = self.daemon("deck"), self.daemon("ubuntu")
+        d1 = self.play(deck, "deck-native", b"deck")
+        answer = ubuntu.decide(GOI, [], os_family=ss.LINUX)
+        self.assertEqual((answer["action"], answer["restore"]["id"]), (ss.RESTORE, d1))
+        ubuntu.set_base(GOI, d1)
+        l1 = self.play(ubuntu, "linux", b"desk")
+        answer = deck.decide(GOI, self.hashes(d1), os_family=ss.LINUX)
+        self.assertEqual((answer["action"], answer["restore"]["id"]), (ss.RESTORE, l1))
+
+    def test_proton_on_the_deck_and_windows_share(self):
+        deck, pc1 = self.daemon("deck"), self.daemon("pc1")
+        # The picker on the Deck saw Proton; ludusavi's mapping agrees.
+        d1 = self.play(deck, "proton", b"deck", os_family=ss.WINDOWS, game=GAME)
+        answer = pc1.decide(GAME, [], os_family=ss.WINDOWS)
+        self.assertEqual((answer["action"], answer["restore"]["id"]), (ss.RESTORE, d1))
+        pc1.set_base(GAME, d1)
+        e1 = self.play(pc1, "windows", b"pc", game=GAME)
+        answer = deck.decide(GAME, self.hashes(d1, GAME), os_family=ss.WINDOWS)
+        self.assertEqual((answer["action"], answer["restore"]["id"]), (ss.RESTORE, e1))
+        # With no word from the picker, the Deck's own Proton snapshot says
+        # Windows, not the Deck's own OS.
+        self.assertEqual(deck.decide(GAME, self.hashes(d1, GAME))["os"], ss.WINDOWS)
+
+    def test_a_proton_save_with_no_hint_is_still_windows(self):
+        deck = self.daemon("deck")
+        d1 = self.play(deck, "proton", b"deck", game=GAME)
+        manifest = ss.read_game(self.store, GAME).manifests[d1]
+        self.assertEqual(manifest["os"], ss.WINDOWS)
+
+    def test_legacy_deck_and_pc_histories_keep_working(self):
+        # The existing snapshots: no "os" field, committed straight.
+        def legacy(device, kind, save, parents=()):
+            source = os_backup(tempfile.mkdtemp(dir=self.dir), kind, save)
+            manifest = ss.make_manifest(GAME, device, ss.scan_dir(source), list(parents))
+            ss.commit(self.store, manifest, source)
+            return manifest["id"]
+        d1 = legacy("deck", "proton", b"deck")
+        e1 = legacy("pc1", "windows", b"pc", parents=[d1])
+        deck = self.daemon("deck")
+        deck.set_base(GAME, d1)
+        answer = deck.decide(GAME, self.hashes(d1, GAME), os_family=ss.WINDOWS)
+        self.assertEqual((answer["action"], answer["restore"]["id"]), (ss.RESTORE, e1))
+        # A daemon asked by an older picker, with no family, gets there too.
+        self.assertEqual(deck.decide(GAME, self.hashes(d1, GAME))["action"], ss.RESTORE)
+
+    def test_a_save_of_another_os_cannot_be_chosen_here(self):
+        mac, ubuntu = self.daemon("imac"), self.daemon("ubuntu")
+        self.play(mac, "mac", b"mac")
+        l1 = self.play(ubuntu, "linux", b"linux")
+        with self.assertRaises(ss.StoreRefused) as caught:
+            mac.choose(GOI, l1)
+        self.assertIn("Linux", str(caught.exception))
+
+    def test_choosing_settles_only_this_os(self):
+        a, b, mac = self.daemon("deck"), self.daemon("ubuntu"), self.daemon("imac")
+        d1 = self.play(a, "deck-native", b"d")
+        l1 = self.play(b, "linux", b"l")
+        m1 = self.play(mac, "mac", b"m")
+        chosen = a.choose(GOI, l1)
+        a.wait(chosen["merge"], 10)
+        view = ss.read_game(self.store, GOI)
+        merge = view.manifests[chosen["merge"]]
+        self.assertEqual(merge["os"], ss.LINUX)
+        self.assertEqual(sorted(merge["parents"]), sorted([d1, l1]))
+        families = dict(ss.view_families(view))
+        self.assertEqual(families[ss.LINUX].heads, [chosen["merge"]])
+        self.assertEqual(families[ss.MAC].heads, [m1])
+
+    def test_a_pending_choice_of_another_os_is_not_restored(self):
+        mac, ubuntu = self.daemon("imac"), self.daemon("ubuntu")
+        m1 = self.play(mac, "mac", b"mac")
+        l1 = self.play(ubuntu, "linux", b"linux")
+        mac.state.set_restore_pending(GOI, l1)
+        self.assertEqual(mac.decide(GOI, [], os_family=ss.MAC)["action"], ss.LAUNCH)
+        self.assertEqual(mac.decide(GOI, self.hashes(m1), os_family=ss.MAC)["action"],
+                         ss.LAUNCH)
+
+    def test_status_says_each_queued_saves_os(self):
+        deck = self.daemon("deck")
+        deck.paused = True
+        source = os_backup(tempfile.mkdtemp(dir=self.dir), "proton", b"x")
+        deck.stage(GAME, source)
+        status = deck.status()
+        self.assertEqual([q["os"] for q in status["queued"]], [ss.WINDOWS])
+        self.assertIn(status["os"], ss.FAMILIES)
+
+
 class TheHTTPFace(Base):
     def setUp(self):
         Base.setUp(self)
@@ -287,6 +423,16 @@ class TheHTTPFace(Base):
         self.assertEqual(c.wait(staged["snap"], 10), {"state": "committed"})
         self.assertEqual(c.decide(GAME, [])["action"], ss.LAUNCH)
         self.assertEqual(c.status()["queued"], [])
+
+    def test_the_os_travels_over_http(self):
+        c = self.client()
+        staged = c.stage(GOI, os_backup(tempfile.mkdtemp(dir=self.dir), "deck-native", b"A"),
+                         os_family=ss.WINDOWS)
+        self.assertEqual(c.wait(staged["snap"], 10), {"state": "committed"})
+        manifest = ss.read_game(self.store, GOI).manifests[staged["snap"]]
+        self.assertEqual(manifest["os"], ss.WINDOWS)
+        self.assertEqual(c.decide(GOI, [], os_family=ss.MAC)["os"], ss.MAC)
+        self.assertEqual(c.decide(GOI, [], os_family=ss.MAC)["heads"], [])
 
     def test_pause_and_resume_over_http(self):
         c = self.client()
@@ -345,8 +491,8 @@ class Connecting(Base):
 
 class Settings(unittest.TestCase):
     def test_secrets_are_plain_off_windows(self):
-        if os.name == "nt":
-            self.skipTest("Windows encrypts")
+        if os.name == "nt" or sys.platform == "darwin":
+            self.skipTest("Windows and macOS seal it")
         self.assertEqual(slotd.protect("s"), "s")
         self.assertEqual(slotd.unprotect("s"), "s")
 
@@ -362,6 +508,119 @@ class Settings(unittest.TestCase):
         self.assertTrue(sealed.startswith("dpapi:"))
         self.assertNotIn("the secret", sealed)
         self.assertEqual(slotd.unprotect(sealed), "the secret")
+
+
+class FakeSecurity(object):
+    """/usr/bin/security with a Keychain in a dict. Records every argv and
+    every stdin, so a test can prove where a key travelled."""
+
+    def __init__(self, broken=False, silent_failure=False):
+        self.items = {}
+        self.argvs = []
+        self.stdins = []
+        self.broken = broken
+        self.silent_failure = silent_failure
+
+    def __call__(self, argv, input=None, capture_output=True, text=True, timeout=None):
+        self.argvs.append(list(argv))
+        self.stdins.append(input)
+        if self.broken:
+            raise OSError("no such file")
+        args = argv[1:]
+        if args == ["-i"]:
+            for line in (input or "").splitlines():
+                words = shlex.split(line)
+                if words[0] == "add-generic-password" and not self.silent_failure:
+                    opts = dict(zip(words[1:], words[2:]))
+                    self.items[(opts["-s"], opts["-a"])] = opts["-w"]
+            return subprocess.CompletedProcess(argv, 0, "", "")
+        if args[0] == "find-generic-password":
+            opts = dict(zip(args, args[1:]))
+            key = (opts["-s"], opts["-a"])
+            if key not in self.items:
+                return subprocess.CompletedProcess(argv, 44, "", "not found")
+            return subprocess.CompletedProcess(argv, 0, self.items[key] + "\n", "")
+        return subprocess.CompletedProcess(argv, 1, "", "unknown")
+
+
+class Keychain(unittest.TestCase):
+    """macOS: secrets go into the login Keychain through /usr/bin/security."""
+
+    def test_a_secret_goes_in_and_the_file_keeps_only_its_name(self):
+        fake = FakeSecurity()
+        sealed = slotd.protect("s3cr\"et\\x y", name="secret_key",
+                               platform="darwin", runner=fake)
+        self.assertEqual(sealed, "keychain:secret_key")
+        self.assertEqual(fake.items[("BlockSlot", "secret_key")], "s3cr\"et\\x y")
+        self.assertEqual(slotd.unprotect(sealed, platform="darwin", runner=fake),
+                         "s3cr\"et\\x y")
+
+    def test_the_key_never_reaches_a_command_line(self):
+        fake = FakeSecurity()
+        slotd.protect("TOPSECRET", name="secret_key", platform="darwin", runner=fake)
+        for argv in fake.argvs:
+            self.assertNotIn("TOPSECRET", " ".join(argv))
+        self.assertTrue(any("TOPSECRET" in (stdin or "") for stdin in fake.stdins))
+
+    def test_no_keychain_keeps_the_key_in_the_private_file(self):
+        self.assertEqual(slotd.protect("k", name="secret_key", platform="darwin",
+                                       runner=FakeSecurity(broken=True)), "k")
+
+    def test_a_write_that_did_not_land_is_not_trusted(self):
+        fake = FakeSecurity(silent_failure=True)
+        self.assertEqual(slotd.protect("k", name="secret_key", platform="darwin",
+                                       runner=fake), "k")
+
+    def test_a_key_with_a_line_break_stays_in_the_file(self):
+        fake = FakeSecurity()
+        self.assertEqual(slotd.protect("a\nb", name="x", platform="darwin",
+                                       runner=fake), "a\nb")
+        self.assertEqual(fake.argvs, [])
+
+    def test_a_missing_item_is_refused_in_words(self):
+        with self.assertRaises(ss.StoreRefused) as caught:
+            slotd.unprotect("keychain:secret_key", platform="darwin",
+                            runner=FakeSecurity())
+        self.assertIn("Keychain", str(caught.exception))
+
+    def test_a_keychain_secret_is_refused_off_the_mac(self):
+        with self.assertRaises(ss.StoreRefused):
+            slotd.unprotect("keychain:secret_key", platform="linux")
+
+    def test_plain_text_passes_through(self):
+        self.assertEqual(slotd.unprotect("plain", platform="darwin",
+                                         runner=FakeSecurity(broken=True)), "plain")
+
+    def test_sealed_forms_are_recognised(self):
+        self.assertTrue(slotd.is_sealed("dpapi:AAAA"))
+        self.assertTrue(slotd.is_sealed("keychain:secret_key"))
+        self.assertFalse(slotd.is_sealed("plain"))
+        self.assertFalse(slotd.is_sealed(None))
+
+    def test_settings_open_a_keychain_secret(self):
+        fake = FakeSecurity()
+        fake.items[("BlockSlot", "secret_key")] = "SK"
+        folder = tempfile.mkdtemp(prefix="slotd-kc-")
+        self.addCleanup(shutil.rmtree, folder, True)
+        path = os.path.join(folder, "savepick.json")
+        with open(path, "w") as handle:
+            json.dump({"store": {"type": "s3", "secret_key": "keychain:secret_key",
+                                 "device": "mac"}}, handle)
+        real = slotd.unprotect
+        slotd.unprotect = lambda text: real(text, platform="darwin", runner=fake)
+        try:
+            store, device = slotd.load_settings(path)
+        finally:
+            slotd.unprotect = real
+        self.assertEqual(store["secret_key"], "SK")
+        self.assertEqual(device, "mac")
+
+    @unittest.skipUnless(sys.platform == "darwin", "macOS only")
+    def test_security_is_there_on_a_mac(self):
+        # Reads only: a search for an item no one has.
+        code, _out = slotd._security(["find-generic-password", "-s",
+                                      "BlockSlot-test-none", "-a", "none", "-w"])
+        self.assertIsNotNone(code)
 
 
 class CentralSettings(Base):
@@ -483,6 +742,98 @@ class CentralSettings(Base):
     def test_other_settings_survive(self):
         self.d.sync_config(force=True)
         self.assertEqual(self.read()["store"]["type"], "local")
+
+
+# ------------------------------------------------------------------ the Linux desktop
+
+
+def _snap_env(real):
+    """What a game started by snap Steam sees (probed on an Ubuntu laptop, 2026-09-28)."""
+    inside = os.path.join(real, "snap", "steam", "common")
+    return {"SNAP_NAME": "steam", "SNAP_REAL_HOME": real, "HOME": inside,
+            "XDG_CONFIG_HOME": os.path.join(inside, ".config"),
+            "XDG_DATA_HOME": os.path.join(inside, ".local", "share")}
+
+
+@unittest.skipIf(sys.platform == "win32", "the snap is Linux; Windows has its own places")
+class SnapPlaces(unittest.TestCase):
+    """A picker inside snap Steam and a daemon outside it name one queue."""
+
+    def setUp(self):
+        self.real = tempfile.mkdtemp(prefix="slotd-home-")
+        self.addCleanup(shutil.rmtree, self.real, True)
+
+    def test_settings_come_from_the_real_home(self):
+        with mock.patch.dict(os.environ, _snap_env(self.real)):
+            self.assertEqual(slotd.default_config_path(),
+                             os.path.join(self.real, ".config", "savepick.json"))
+
+    @unittest.skipUnless(sys.platform.startswith("linux"), "XDG state is Linux")
+    def test_the_queue_is_the_one_outside_the_snap(self):
+        with mock.patch.dict(os.environ, _snap_env(self.real)):
+            os.environ["XDG_STATE_HOME"] = os.path.join(self.real, "snap", "x")
+            self.assertEqual(slotd.default_state_dir(),
+                             os.path.join(self.real, ".local", "state",
+                                          "blockslot", "store"))
+            self.assertEqual(slotd.systemd_unit_path(),
+                             os.path.join(self.real, ".config", "systemd", "user",
+                                          "blockslot.service"))
+
+    @unittest.skipUnless(sys.platform.startswith("linux"), "XDG state is Linux")
+    def test_outside_a_snap_xdg_is_honoured(self):
+        with mock.patch.dict(os.environ, {"XDG_STATE_HOME": self.real}):
+            os.environ.pop("SNAP_NAME", None)
+            self.assertEqual(slotd.default_state_dir(),
+                             os.path.join(self.real, "blockslot", "store"))
+
+
+class _Ran(object):
+    def __init__(self, code):
+        self.calls = []
+        self.code = code
+
+    def __call__(self, argv, **_kwargs):
+        self.calls.append(argv)
+        return mock.Mock(returncode=self.code)
+
+
+@unittest.skipUnless(sys.platform.startswith("linux"), "systemd is Linux")
+class StartThroughSystemd(unittest.TestCase):
+    def setUp(self):
+        self.dir = tempfile.mkdtemp(prefix="slotd-unit-")
+        self.addCleanup(shutil.rmtree, self.dir, True)
+        patcher = mock.patch.dict(os.environ, {"XDG_CONFIG_HOME": self.dir})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        os.environ.pop("SNAP_NAME", None)
+
+    def _unit(self):
+        folder = os.path.join(self.dir, "systemd", "user")
+        os.makedirs(folder)
+        with open(os.path.join(folder, "blockslot.service"), "w") as handle:
+            handle.write("[Service]\n")
+
+    def test_the_unit_is_started_when_it_is_installed(self):
+        self._unit()
+        ran = _Ran(0)
+        with mock.patch.object(slotd.subprocess, "Popen") as popen:
+            self.assertTrue(slotd.start_detached(runner=ran))
+        self.assertEqual(ran.calls, [["systemctl", "--user", "--no-block", "start",
+                                      "blockslot.service"]])
+        popen.assert_not_called()
+
+    def test_without_the_unit_it_forks_as_before(self):
+        ran = _Ran(0)
+        with mock.patch.object(slotd.subprocess, "Popen") as popen:
+            self.assertTrue(slotd.start_detached(runner=ran))
+        self.assertEqual(ran.calls, [])
+        self.assertIn("--serve", popen.call_args[0][0])
+
+    def test_a_systemctl_that_fails_falls_back_to_a_fork(self):
+        self._unit()
+        with mock.patch.object(slotd.subprocess, "Popen") as popen:
+            self.assertTrue(slotd.start_detached(runner=_Ran(1)))
+        self.assertIn("--serve", popen.call_args[0][0])
 
 
 if __name__ == "__main__":

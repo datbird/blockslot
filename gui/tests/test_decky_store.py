@@ -229,8 +229,23 @@ class Forks(Temp):
         deck, _a, _b = self.fork()
         empty = ss.LocalState(os.path.join(self.dir, "state-fresh"))
         self.assertEqual(bs.list_forks(self.store, empty, ss)["forks"], [])
-        got = bs.list_forks(self.store, empty, ss, extra=[GAME])
+        # Asked as the Deck, whose own snapshots say it plays this game's
+        # Windows build (under Proton): the Windows fork is its to settle.
+        got = bs.list_forks(self.store, empty, ss, extra=[GAME], device="deck")
         self.assertEqual(len(got["forks"]), 1)
+
+    def test_a_fork_of_another_os_is_not_this_devices(self):
+        # Two Windows saves (drive-C) and a device with no history of the
+        # game on a Mac: it plays the Mac build, which has no fork.
+        self.fork()
+        fresh = ss.LocalState(os.path.join(self.dir, "state-fresh"))
+        real = ss.host_family
+        ss.host_family = lambda platform=None: ss.MAC
+        try:
+            got = bs.list_forks(self.store, fresh, ss, extra=[GAME], device="mac")
+        finally:
+            ss.host_family = real
+        self.assertEqual(got["forks"], [])
 
     def test_choose_closes_the_fork(self):
         deck, a, _b = self.fork()
