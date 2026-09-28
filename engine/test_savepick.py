@@ -3775,6 +3775,32 @@ class TestTheWholeGameStops(unittest.TestCase):
         self.assertEqual(savepick.descendants(10, table), [11, 12, 13])
         self.assertEqual(savepick.descendants(13, table), [])
 
+    def test_a_mac_app_opened_with_open_w_is_found(self):
+        app = "/Games/Getting Over It/GettingOverIt.app"
+        self.assertEqual(savepick.opened_app(["/usr/bin/open", "-W", app + "/"]), app)
+        self.assertIsNone(savepick.opened_app(["/usr/bin/open", app]))
+        self.assertIsNone(savepick.opened_app(["/games/game.x86_64"]))
+        listing = ("  101 /usr/bin/open\n"
+                   "  202 %s/Contents/MacOS/Getting Over It\n"
+                   "  303 %s/Contents/Frameworks/Helper.app/Contents/MacOS/Helper\n"
+                   "  404 /Games/Getting Over It/GettingOverIt.app.bak/Contents/MacOS/x\n"
+                   "  505 /Applications/Steam.app/Contents/MacOS/steam_osx\n") % (app, app)
+        run = mock.Mock(return_value=mock.Mock(stdout=listing))
+        self.assertEqual(savepick.app_pids(app, run=run), [202, 303])
+
+    def test_a_stop_through_open_w_reaches_the_app(self):
+        import signal
+        proc = mock.Mock(pid=101, args=["/usr/bin/open", "-W", "/G/Game.app"])
+        proc.poll.return_value = None
+        savepick.CHILD = proc
+        with mock.patch.object(savepick, "is_windows", return_value=False), \
+                mock.patch.object(savepick, "descendants", return_value=[]), \
+                mock.patch.object(savepick, "app_pids", return_value=[202]), \
+                mock.patch.object(savepick, "start_of", return_value="t"):
+            self.assertTrue(savepick.stop_child(signal.SIGTERM))
+        self.assertEqual(savepick.STOP_TREE, [(202, "t")])
+        proc.send_signal.assert_called_once_with(signal.SIGTERM)
+
     def test_nothing_left_means_no_extra_signal(self):
         savepick.STOP_TREE[:] = [(999999999, None)]
         with mock.patch.object(savepick.os, "kill") as kill:

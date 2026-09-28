@@ -4226,6 +4226,35 @@ def wait_for_leftovers():
     wait_until(time.monotonic() + 5)
 
 
+def opened_app(args):
+    """The .app a Mac launch handed to `open -W`, or None.
+
+    `open` asks LaunchServices to start the app, so the game is launchd's
+    child, not ours, and no walk down from the process we started finds it.
+    """
+    args = list(args or [])
+    if len(args) >= 3 and args[0] == "/usr/bin/open" and args[1] == "-W":
+        return args[2].rstrip("/")
+    return None
+
+
+def app_pids(app, run=None):
+    """Every process whose program lives inside `app` (a Mac .app folder)."""
+    run = run or subprocess.run
+    try:
+        out = run(["ps", "-A", "-o", "pid=", "-o", "comm="], capture_output=True,
+                  text=True, timeout=10).stdout
+    except (OSError, subprocess.SubprocessError):
+        return []
+    inside = app + "/Contents/"
+    found = []
+    for line in out.splitlines():
+        parts = line.strip().split(None, 1)
+        if len(parts) == 2 and parts[0].isdigit() and parts[1].startswith(inside):
+            found.append(int(parts[0]))
+    return sorted(found)
+
+
 def stop_child(signum):
     """Pass a stop signal to the game, and start the clock on its grace period."""
     global STOP_DEADLINE
@@ -4239,7 +4268,13 @@ def stop_child(signum):
         # Before the signal: once the launcher dies, its orphans belong to
         # someone else and nothing links them to this game any more.
         try:
-            STOP_TREE[:] = [(child, start_of(child)) for child in descendants(pid)]
+            tree = descendants(pid)
+            # Seen on a macOS VM on 2026-09-28: a stop reached `open -W` and
+            # the backup ran while Getting Over It kept playing.
+            app = opened_app(getattr(proc, "args", None))
+            if app:
+                tree += [p for p in app_pids(app) if p not in tree]
+            STOP_TREE[:] = [(child, start_of(child)) for child in tree]
         except Exception as exc:
             log("could not read the game's process tree: %s" % exc)
     try:
