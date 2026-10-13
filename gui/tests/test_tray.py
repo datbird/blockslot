@@ -322,6 +322,84 @@ class RunDaemon(unittest.TestCase):
         self.assertTrue(daemon.stopping)
 
 
+class FakeMutexApi(object):
+    """CreateMutexW as Windows answers it: a handle every time, and
+    ERROR_ALREADY_EXISTS from the second open of the same name on."""
+
+    def __init__(self, fail=False):
+        self.names = set()
+        self.closed = []
+        self.fail = fail
+        self.error = 0
+        self.next_handle = 100
+
+    def CreateMutexW(self, attrs, owner, name):
+        if self.fail:
+            return None
+        self.error = tray.ERROR_ALREADY_EXISTS if name in self.names else 0
+        self.names.add(name)
+        self.next_handle += 1
+        return self.next_handle
+
+    def CloseHandle(self, handle):
+        self.closed.append(handle)
+        return True
+
+    def last_error(self):
+        return self.error
+
+
+class OneIcon(unittest.TestCase):
+    """A second launcher at the same login must not add a second icon."""
+
+    def setUp(self):
+        tray._icon_claim = None
+
+    def tearDown(self):
+        tray._icon_claim = None
+
+    def test_the_first_claim_wins_and_a_second_process_loses(self):
+        api = FakeMutexApi()
+        self.assertTrue(tray.claim_icon(api, windows=True))
+        tray._icon_claim = None      # as if this were a second process
+        self.assertFalse(tray.claim_icon(api, windows=True))
+        self.assertEqual(api.closed, [102])
+
+    def test_the_holder_asking_again_still_holds_it(self):
+        api = FakeMutexApi()
+        self.assertTrue(tray.claim_icon(api, windows=True))
+        self.assertTrue(tray.claim_icon(api, windows=True))
+
+    def test_no_mutex_at_all_still_shows_the_icon(self):
+        self.assertTrue(tray.claim_icon(FakeMutexApi(fail=True), windows=True))
+
+    def test_off_windows_there_is_nothing_to_claim(self):
+        self.assertTrue(tray.claim_icon(FakeMutexApi(), windows=False))
+
+    def test_a_losing_daemon_host_starts_no_daemon(self):
+        api = FakeMutexApi()
+        api.CreateMutexW(None, False, tray.ICON_MUTEX)
+        real = tray.claim_icon
+        tray.claim_icon = lambda: real(api, windows=True)
+        try:
+            self.assertEqual(tray._run_with_tray(None, None, None, None), 0)
+        finally:
+            tray.claim_icon = real
+
+
+@unittest.skipUnless(WINDOWS, "named mutexes are Windows only")
+class TheRealMutex(unittest.TestCase):
+    def test_a_second_open_of_the_name_is_refused(self):
+        tray._icon_claim = None
+        self.assertTrue(tray.claim_icon())
+        held = tray._icon_claim
+        try:
+            tray._icon_claim = None
+            self.assertFalse(tray.claim_icon())
+        finally:
+            tray._icon_claim = held
+
+
 @unittest.skipUnless(WINDOWS, "the notification area is Windows only")
 class TheRealIcon(unittest.TestCase):
     def test_the_icon_is_added_and_removed(self):

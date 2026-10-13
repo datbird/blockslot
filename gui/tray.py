@@ -284,13 +284,58 @@ class ServiceProxy(object):
             self._paused = bool(client.pause(value).get("paused"))
 
 
+ICON_MUTEX = "Local\\BlockSlot.TrayIcon"
+ERROR_ALREADY_EXISTS = 183
+_icon_claim = None
+
+
+def claim_icon(api=None, windows=None):
+    """True when this process may show the icon in this session.
+
+    Two launchers can start the icon at one login: the Run value, and a
+    deploy that restarts the icon with a one-shot task. Each would add its
+    own icon. A named mutex in the session's Local namespace lets the first
+    one win; Windows frees it when that process exits, crash included, so a
+    dead icon never blocks the next one. The handle is kept for the life of
+    the process on purpose.
+    """
+    global _icon_claim
+    if not (paths.is_windows() if windows is None else windows):
+        return True
+    if _icon_claim is not None:
+        return True
+    if api is None:
+        import ctypes
+        from ctypes import wintypes as w
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        create = kernel32.CreateMutexW
+        create.restype = w.HANDLE
+        create.argtypes = (w.LPVOID, w.BOOL, w.LPCWSTR)
+        close = kernel32.CloseHandle
+        close.restype = w.BOOL
+        close.argtypes = (w.HANDLE,)
+        last_error = ctypes.get_last_error
+    else:
+        create, close, last_error = api.CreateMutexW, api.CloseHandle, api.last_error
+    handle = create(None, False, ICON_MUTEX)
+    if not handle:
+        # No mutex at all is not a reason to go without an icon.
+        return True
+    if last_error() == ERROR_ALREADY_EXISTS:
+        close(handle)
+        return False
+    _icon_claim = handle
+    return True
+
+
 def run_tray(config=None):
     """`--tray`: the icon for the Blockslot service, in the user's session.
 
     The service holds the daemon in session 0, where no icon can be shown.
     This process holds only the icon. When no service is installed it falls
     back to --daemon, which hosts the daemon here, so a PC without admin
-    rights still gets both.
+    rights still gets both. Exits 0 at once when another process in this
+    session already shows the icon.
     """
     slotd = load_slotd()
     settings, _device = slotd.load_settings(config)
@@ -298,6 +343,8 @@ def run_tray(config=None):
         return 0
     if not settings.get("service"):
         return run_daemon(config)
+    if not claim_icon():
+        return 0
     state_dir = settings.get("state_dir") or slotd.default_state_dir()
     proxy = ServiceProxy(lambda: slotd._client_from_info(state_dir))
     host = TrayHost(proxy, config=config)
@@ -334,6 +381,11 @@ def run_daemon(config=None, with_tray=None):
 
 
 def _run_with_tray(slotd, daemon, state_dir, config):
+    if not claim_icon():
+        # Another process in this session shows the icon, and it hosts a
+        # daemon or watches the service. A second daemon here would only
+        # race it for the store.
+        return 0
     server = threading.Thread(target=slotd.serve, args=(daemon, state_dir),
                               name="slotd", daemon=True)
     server.start()
